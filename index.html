@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pollinator Panic 🐝</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🐝</span>
+      <div>
+        <h1>Pollinator Panic</h1>
+        <p>Your hand controls the bee · Heal the ecosystem · SDG 15: Life on Land</p>
+      </div>
+    </div>
+    <button id="fs-btn" class="ghost-btn" type="button">⛶ Fullscreen</button>
+  </header>
+
+  <main class="layout">
+    <section class="stage">
+      <video id="cam-video" autoplay playsinline muted></video>
+      <canvas id="game-canvas" width="1280" height="720"></canvas>
+
+      <div class="hud">
+        <div class="meter">
+          <span class="meter-label">🐝 BEE</span>
+          <div class="bar"><i id="bar-bee" style="background:#37d67a"></i></div>
+          <span id="val-bee" class="meter-val">100%</span>
+        </div>
+        <div class="meter">
+          <span class="meter-label">🌍 ECOSYSTEM</span>
+          <div class="bar"><i id="bar-eco" style="background:#7ddf64"></i></div>
+          <span id="val-eco" class="meter-val">0%</span>
+        </div>
+        <div class="counter">🌸 <strong id="val-flowers">0</strong></div>
+        <div id="timer-pill" class="counter timer-pill">⏱ 90s</div>
+        <button id="mute-btn" class="mute-btn" type="button" title="Toggle sound">🔊</button>
+      </div>
+
+      <canvas id="cam-preview" width="200" height="150"></canvas>
+      <div id="combo" class="combo hidden">COMBO x1</div>
+      <div id="toast" class="toast"></div>
+
+      <div id="start-overlay" class="overlay">
+        <h2>🐝 POLLINATOR PANIC</h2>
+        <p class="tagline">You are the last bee of a dying ecosystem.<br/>Pinch your fingers to fly. Pollinate flowers. Bring the land back to life.</p>
+        <div class="howto">
+          <span>✊👉 Pinch = flap</span>
+          <span>🌸 Collect flowers</span>
+          <span>☁️🧴 Avoid smog &amp; pesticide</span>
+          <span>🗑️ Grab plastic (risky!)</span>
+        </div>
+        <p id="vision-status" class="status-line">Camera is off · build 8</p>
+        <button id="start-btn" class="primary-btn" type="button">Start — enable camera</button>
+        <p id="error-msg" class="error-msg"></p>
+        <p class="fineprint">First launch downloads the hand-tracking AI (~10 MB). Spacebar or tap works as a backup flap.</p>
+      </div>
+
+      <div id="gameover-overlay" class="overlay hidden">
+        <h2>🦋 YOUR POLLINATOR IMPACT</h2>
+        <div id="tier-badge" class="tier-badge">🌱 Restoration Hero</div>
+        <div class="impact-grid">
+          <div><b id="imp-flowers">0</b><span>flowers pollinated</span></div>
+          <div><b id="imp-clean">0</b><span>plastic cleaned</span></div>
+          <div><b id="imp-zones">0</b><span>pollution gates cleared</span></div>
+          <div><b id="imp-close">0</b><span>close calls</span></div>
+          <div><b id="imp-combo">0</b><span>best combo</span></div>
+          <div><b id="imp-native">0</b><span>native plants revived</span></div>
+          <div><b id="imp-bee">0%</b><span>bee health kept</span></div>
+          <div><b id="imp-eco">0%</b><span>ecosystem restored</span></div>
+        </div>
+        <div class="final-score">Impact Score · <b id="final-score">0</b></div>
+        <div class="fact-card"><span>📌</span><p id="fact-text"></p></div>
+        <input id="player-name" maxlength="14" placeholder="Your name for the Champions Board" autocomplete="off" />
+        <div class="row">
+          <button id="save-score" class="primary-btn" type="button">🏆 Save to Champions Board</button>
+          <button id="play-again" class="ghost-btn" type="button">▶ Play again (Space)</button>
+        </div>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <h2>🏆 Pollinator Champions</h2>
+      <ol id="leaderboard" class="leaderboard"></ol>
+      <div class="aggregate">
+        <div>🌸 <b id="agg-flowers">0</b> flowers total</div>
+        <div>🌱 avg restored <b id="agg-eco">0%</b></div>
+        <div>🎮 <b id="agg-games">0</b> players</div>
+      </div>
+      <button id="reset-board" class="ghost-btn small" type="button">Reset board</button>
+      <p class="disclaimer">75% of food crops depend on pollinators.<br/>Every player here is learning why that matters. 🌍</p>
+    </aside>
+  </main>
+
+  <script>
+    setTimeout(() => {
+      if (!window.__boothBooted) {
+        const el = document.getElementById("error-msg");
+        if (el) el.textContent = "Game failed to fully load — check internet (AI library downloads from CDN) and hard-refresh with Ctrl+F5.";
+      }
+    }, 7000);
+  </script>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
