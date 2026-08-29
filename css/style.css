@@ -287,6 +287,10 @@ body {
 
 .final-score { font-size: 17px; color: var(--muted); }
 .final-score b { font-size: 26px; color: var(--amber); }
+/* Step 4: results-screen player name + personal-best line */
+.over-player { font-size: 1.05rem; font-weight: 600; opacity: .92; margin-top: -10px; }
+.best-note { min-height: 1.5em; font-weight: 800; letter-spacing: .3px; color: var(--muted); }
+.best-note.new-best { color: #ffd166; text-shadow: 0 0 16px #ffd16640; font-size: 1.1rem; }
 
 .fact-card {
   display: flex;

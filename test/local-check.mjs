@@ -67,9 +67,18 @@ function setOverrideFake() {
           return e ? e.v : null;
         }
         case "ZADD": {
-          const [, k, score, member] = cmd;
-          entry(k).z.set(String(member), Number(score));
-          return 1;
+          // Supports the GT option (Redis >= 6.2): only update when the new
+          // score is strictly higher — the personal-best primitive.
+          const [, k, ...rest] = cmd;
+          const gt = rest.includes("GT");
+          const args = rest.filter((a) => a !== "GT");
+          const score = Number(args[0]);
+          const member = String(args[1]);
+          const z = entry(k).z;
+          const existing = z.get(member);
+          if (gt && existing !== undefined && !(score > existing)) return 0;
+          z.set(member, score);
+          return existing === undefined ? 1 : 0;
         }
         case "ZREVRANGE": {
           const [, k, start, stop] = cmd;
@@ -84,6 +93,12 @@ function setOverrideFake() {
           }
           return out;
         }
+        case "ZSCORE": {
+          const e = store.get(cmd[1]);
+          if (!e) return null;
+          const v = e.z.get(String(cmd[2]));
+          return v === undefined ? null : v;
+        }
         case "ZREVRANK": {
           const [, k, member] = cmd;
           const e = store.get(k);
@@ -97,6 +112,13 @@ function setOverrideFake() {
           const e = entry(k);
           for (let i = 0; i < pairs.length; i += 2) e.h.set(pairs[i], String(pairs[i + 1]));
           return pairs.length / 2;
+        }
+        case "HGET": {
+          purge(cmd[1]);
+          const e = store.get(cmd[1]);
+          if (!e) return null;
+          const f = String(cmd[2]);
+          return e.h.has(f) ? e.h.get(f) : null;
         }
         case "HMGET": {
           const [, k, ...fields] = cmd;
@@ -578,6 +600,101 @@ setOverrideFake();
   assert.equal(lbOk.statusCode, 200);
   assert.match(lbOk.headers["cache-control"], /s-maxage=15/, "normal edge caching preserved");
   ok("normal leaderboard flow + edge-cache header unchanged");
+}
+
+/* ==================== Step 4: retry + personal best ==================== */
+{
+  // --- session: token echo / mint / reject malformed ---
+  const TOK_A = "a".repeat(32);
+  const s1 = await call(sessionHandler, mockReq({ body: { name: "Sujith", playerToken: TOK_A } }));
+  assert.equal(s1.statusCode, 200);
+  assert.equal(s1.body.playerToken, TOK_A, "provided token echoed");
+  const s1b = await call(sessionHandler, mockReq({ body: { name: "Sujith" } }));
+  assert.match(s1b.body.playerToken, /^[a-f0-9]{32}$/, "server mints a token when absent");
+  assert.notEqual(s1b.body.playerToken, TOK_A);
+  const badS = await call(sessionHandler, mockReq({ body: { name: "Sujith", playerToken: "nope" } }));
+  assert.equal(badS.statusCode, 400, "invalid token format -> 400");
+  ok("session: token echoed / minted when absent / malformed -> 400");
+
+  // --- first attempt: entry keyed by playerToken ---
+  const p1 = { ...statsFor({ sessionId: s1.body.sessionId, flowers: 10, cleanup: 2, natives: 1, pipes: 20, closeCalls: 1, bestCombo: 3, bee: 90, eco: 60 }), playerToken: TOK_A };
+  const r1 = await call(scoresHandler, mockReq({ body: p1 }));
+  assert.equal(r1.statusCode, 200);
+  assert.equal(r1.body.score, 435); // 10*10 + 2*20 + 1*50 + 20*5 + 1*25 + 60*2
+  assert.equal(r1.body.newBest, true);
+  assert.equal(r1.body.best, 435);
+  const [z1] = await redis([["ZSCORE", "lb:all", TOK_A]]);
+  assert.equal(Number(z1), 435, "lb:all member is the playerToken");
+  ok("first attempt: leaderboard entry keyed by playerToken, newBest true");
+
+  // --- RETRY with a NEW session + same token, HIGHER score ---
+  const s1c = await call(sessionHandler, mockReq({ body: { name: "Sujith", playerToken: TOK_A } }));
+  assert.notEqual(s1c.body.sessionId, s1.body.sessionId, "retry gets a genuinely new session");
+  const p2 = { ...statsFor({ sessionId: s1c.body.sessionId, flowers: 12, cleanup: 2, natives: 1, pipes: 20, closeCalls: 1, bestCombo: 3, bee: 90, eco: 60 }), playerToken: TOK_A };
+  const r2 = await call(scoresHandler, mockReq({ body: p2 }));
+  assert.equal(r2.statusCode, 200);
+  assert.equal(r2.body.score, 455);
+  assert.equal(r2.body.newBest, true);
+  assert.equal(r2.body.best, 455, "best = the new personal best after the attempt");
+  const [z2] = await redis([["ZSCORE", "lb:all", TOK_A]]);
+  assert.equal(Number(z2), 455, "personal best updated to the higher score");
+  ok("retry higher: SAME player entry updated to 455 (not a duplicate)");
+
+  // --- RETRY with a LOWER score: best stays ---
+  const s1d = await call(sessionHandler, mockReq({ body: { name: "Sujith", playerToken: TOK_A } }));
+  const p3 = { ...statsFor({ sessionId: s1d.body.sessionId, flowers: 8, cleanup: 2, natives: 1, pipes: 20, closeCalls: 1, bestCombo: 3, bee: 90, eco: 60 }), playerToken: TOK_A };
+  const r3 = await call(scoresHandler, mockReq({ body: p3 }));
+  assert.equal(r3.statusCode, 200);
+  assert.equal(r3.body.score, 415);
+  assert.equal(r3.body.newBest, false);
+  assert.equal(r3.body.best, 455);
+  const [z3] = await redis([["ZSCORE", "lb:all", TOK_A]]);
+  assert.equal(Number(z3), 455, "lower retry cannot lower the personal best");
+  const [dz] = await redis([["HGET", `score:detail:${TOK_A}`, "flowers"]]);
+  assert.equal(dz, "12", "details still describe the best run");
+  const [dt] = await redis([["TTL", `score:detail:${TOK_A}`]]);
+  assert.ok(Number(dt) > 0 && Number(dt) <= 2592000, "detail hash has bounded retention");
+  ok("retry lower: best stays 455, details match the best run, TTL bounded");
+
+  // --- one-submission-per-session intact ---
+  const dup = await call(scoresHandler, mockReq({ body: p1 }));
+  assert.equal(dup.statusCode, 409);
+  ok("old session replay -> 409 (one-submission-per-session intact)");
+
+  // --- token bound to the session ---
+  const sX = await call(sessionHandler, mockReq({ body: { name: "X", playerToken: "b".repeat(32) } }));
+  const pX = { ...statsFor({ sessionId: sX.body.sessionId }), playerToken: TOK_A };
+  const rX = await call(scoresHandler, mockReq({ body: pX }));
+  assert.equal(rX.statusCode, 400);
+  assert.match(rX.body.error, /mismatch/);
+  const rBad = await call(scoresHandler, mockReq({ body: { ...statsFor({ sessionId: sX.body.sessionId }), playerToken: "zzz" } }));
+  assert.equal(rBad.statusCode, 400, "malformed payload token -> 400");
+  ok("token bound to session: mismatched/malformed playerToken -> 400");
+
+  // --- same display name, different players -> separate entries ---
+  const TOK_B = "b".repeat(32);
+  const sB = await call(sessionHandler, mockReq({ body: { name: "Sujith", playerToken: TOK_B } }));
+  const rB = await call(scoresHandler, mockReq({ body: { ...statsFor({ sessionId: sB.body.sessionId, flowers: 5 }), playerToken: TOK_B } }));
+  assert.equal(rB.statusCode, 200);
+  assert.equal(rB.body.newBest, true);
+  const [zb] = await redis([["ZSCORE", "lb:all", TOK_B]]);
+  assert.equal(Number(zb), rB.body.score);
+  assert.notEqual(Number(zb), 455);
+  ok("same display name, different token -> independent personal best");
+
+  // --- daily board keeps the per-player daily best ---
+  const todayKey = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const [d1] = await redis([["ZSCORE", `lb:day:${todayKey}`, TOK_A]]);
+  assert.equal(Number(d1), 455, "daily board keeps the day's best per player");
+  ok("daily leaderboard: personal best per player (ZADD GT)");
+
+  // --- legacy payload without playerToken -> sessionId member ---
+  const sL = await call(sessionHandler, mockReq({ body: { name: "Legacy" } }));
+  const rL = await call(scoresHandler, mockReq({ body: statsFor({ sessionId: sL.body.sessionId, flowers: 3 }) }));
+  assert.equal(rL.statusCode, 200);
+  const [zl] = await redis([["ZSCORE", "lb:all", sL.body.sessionId]]);
+  assert.equal(Number(zl), rL.body.score, "legacy member = sessionId");
+  ok("legacy clients (no playerToken): sessionId member, behavior unchanged");
 }
 
 console.log(`\nALL ${passed} CHECKS PASSED ✅`);

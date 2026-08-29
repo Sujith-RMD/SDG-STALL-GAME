@@ -22,6 +22,17 @@ function isSessionId(value) {
 }
 
 /**
+ * A playerToken is the server-issued, per-stall-player identity that lets the
+ * leaderboard keep one personal-best entry per player across retry sessions.
+ * Same format/entropy as a sessionId (128-bit hex) — it is a convenience
+ * handle, NOT a secret or a trust anchor: the server still validates every
+ * stat and computes every score itself.
+ */
+function isPlayerToken(value) {
+  return isSessionId(value);
+}
+
+/**
  * Validate raw gameplay statistics.
  * Returns { ok: true, stats } or { ok: false, error }.
  */
@@ -72,4 +83,4 @@ function validateStats(body, CAPS) {
   return { ok: true, stats };
 }
 
-module.exports = { cleanName, isSessionId, validateStats, NAME_MAX };
+module.exports = { cleanName, isSessionId, isPlayerToken, validateStats, NAME_MAX };

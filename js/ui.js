@@ -26,6 +26,10 @@ export const els = {
   nameStart: $("player-name-start"),
   submitNote: $("submit-note"),
   againBtn: $("play-again"),
+  retryBtn: $("retry-btn"),
+  newGameBtn: $("new-game-btn"),
+  overPlayer: $("over-player"),
+  bestNote: $("best-note"),
   board: $("leaderboard"),
   aggGames: $("agg-games"),
   aggFlowers: $("agg-flowers"),
@@ -77,6 +81,17 @@ export function showGameOver(r, tierTitle, fact) {
   els.fact.textContent = fact;
   els.submitNote.textContent = "";
   els.gameover.classList.remove("hidden");
+}
+
+/* Step 4: "Best: N" / "🏆 NEW BEST!" line on the results screen. */
+export function setBestNote(best, newBest) {
+  if (best == null) {
+    els.bestNote.textContent = "";
+    els.bestNote.classList.remove("new-best");
+    return;
+  }
+  els.bestNote.textContent = newBest ? "🏆 NEW BEST!" : `Best: ${best}`;
+  els.bestNote.classList.toggle("new-best", !!newBest);
 }
 
 export function updateHUD(bee, eco, flowers) {

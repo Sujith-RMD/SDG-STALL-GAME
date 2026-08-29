@@ -66,6 +66,7 @@
 
       <div id="gameover-overlay" class="overlay hidden">
         <h2>🦋 YOUR POLLINATOR IMPACT</h2>
+        <div id="over-player" class="over-player"></div>
         <div id="tier-badge" class="tier-badge">🌱 Restoration Hero</div>
         <div class="impact-grid">
           <div><b id="imp-flowers">0</b><span>flowers pollinated</span></div>
@@ -78,10 +79,12 @@
           <div><b id="imp-eco">0%</b><span>ecosystem restored</span></div>
         </div>
         <div class="final-score">Impact Score · <b id="final-score">0</b></div>
+        <div id="best-note" class="best-note"></div>
         <div class="fact-card"><span>📌</span><p id="fact-text"></p></div>
         <p id="submit-note" class="status-line"></p>
         <div class="row">
-          <button id="play-again" class="ghost-btn" type="button">▶ Play again (Space / pinch)</button>
+          <button id="retry-btn" class="primary-btn" type="button">🔁 RETRY (Space / pinch)</button>
+          <button id="new-game-btn" class="ghost-btn" type="button">👤 NEW GAME</button>
         </div>
       </div>
     </section>

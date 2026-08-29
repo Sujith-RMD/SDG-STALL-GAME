@@ -1,7 +1,7 @@
 import { Ecosystem } from "./ecosystem.js";
 import { VisionManager } from "./vision.js";
 import { Game } from "./game.js";
-import { els, toast, setStartStatus, startError, hideStart, showGameOver, updateHUD, updateTimer, renderBoard, drawPreview, toggleFullscreen, updateCombo, setBoardStatus } from "./ui.js";
+import { els, toast, setStartStatus, startError, hideStart, showGameOver, updateHUD, updateTimer, renderBoard, drawPreview, toggleFullscreen, updateCombo, setBoardStatus, setBestNote } from "./ui.js";
 
 const STORAGE_KEY = "pollinator-panic-v1";
 window.__boothBooted = false;
@@ -33,6 +33,37 @@ let overAt = 0; // when the results screen appeared — gates pinch-to-restart
 let playerName = "";
 let sessionId = null;
 let backendUp = null;
+
+/* ---------- Step 4: retry identity ----------
+ * playerToken: server-issued identity grouping one student's retry attempts
+ * into a single personal-best leaderboard entry. Stored in sessionStorage —
+ * per-tab, so closing/refreshing the tab safely defaults to "a new student"
+ * (no false merges; worst case a duplicate entry, same as pre-Step-4).
+ * The remembered NAME is convenience-only (prefills the start input) and is
+ * never treated as identity.
+ */
+const TOKEN_KEY = "pp_player_token";
+const NAME_KEY = "pp_player_name";
+let playerToken = null;
+try { playerToken = sessionStorage.getItem(TOKEN_KEY) || null; } catch {}
+try {
+  const savedName = localStorage.getItem(NAME_KEY);
+  if (savedName) {
+    playerName = savedName;
+    els.nameStart.value = savedName;
+  }
+} catch {}
+function rememberName() {
+  try { localStorage.setItem(NAME_KEY, playerName); } catch {}
+}
+function forgetIdentity() {
+  playerToken = null;
+  playerName = "";
+  sessionId = null;
+  try { sessionStorage.removeItem(TOKEN_KEY); } catch {}
+  try { localStorage.removeItem(NAME_KEY); } catch {}
+  els.nameStart.value = "";
+}
 
 const eco = new Ecosystem();
 const game = new Game(els.canvas, eco);
@@ -85,9 +116,8 @@ function waitFor(pred, timeoutMs) {
 }
 
 els.startBtn.addEventListener("click", onStart);
-els.againBtn.addEventListener("click", () => {
-  if (state === "over") startGame();
-});
+els.retryBtn.addEventListener("click", () => { if (state === "over") retryGame(); });
+els.newGameBtn.addEventListener("click", () => { if (state === "over") newGame(); });
 els.fsBtn.addEventListener("click", toggleFullscreen);
 
 els.muteBtn.textContent = game.music.muted ? "🔇" : "🔊";
@@ -120,6 +150,7 @@ async function onStart() {
     return;
   }
   playerName = name;
+  rememberName(); // convenience-only prefill for future sessions on this device
   els.error.textContent = "";
   els.startBtn.disabled = true;
   setStartStatus("Connecting to the global board…");
@@ -183,7 +214,7 @@ function handleAction(fromKey = false) {
     const el = document.activeElement;
     const typing = !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
     const settled = performance.now() - overAt > 2500;
-    if (!typing && (fromKey || settled)) startGame();
+    if (!typing && (fromKey || settled)) retryGame();
   }
 }
 
@@ -221,6 +252,8 @@ function endGame() {
     bestCombo: game.bestCombo,
     score: game.liveScore + Math.round(eco.value * 2),
   };
+  els.overPlayer.textContent = playerName || "Anonymous Bee";
+  setBestNote(null, false); // filled in when the submission answers
   showGameOver(pendingReport, tierTitle(pendingReport.eco), FACTS[Math.floor(Math.random() * FACTS.length)]);
 
   // Auto-submit: no save button. Global when available, local otherwise.
@@ -230,6 +263,43 @@ function endGame() {
   } else {
     saveLocalFallback(pendingReport);
   }
+}
+
+/* ---------- Step 4: RETRY (same player, new session) / NEW GAME ---------- */
+
+let retrying = false;
+
+async function retryGame() {
+  if (state !== "over" || retrying) return;
+  retrying = true;
+  els.retryBtn.disabled = true;
+  els.submitNote.textContent = "🌍 Starting your next run…";
+  // A NEW session for the new attempt — one-submission-per-session still
+  // holds; the SAME playerToken keeps the leaderboard entry unified as the
+  // player's personal best.
+  await mintSession();
+  els.retryBtn.disabled = false;
+  retrying = false;
+  startGame(); // camera stream + calibration persist — instant restart
+}
+
+function newGame() {
+  if (state !== "over" || retrying) return;
+  forgetIdentity(); // clears token + name: the next student is a brand-new player
+  if (vision.stream) {
+    vision.stream.getTracks().forEach((t) => t.stop());
+    vision.stream = null;
+  }
+  els.video.srcObject = null; // camera off while waiting for the next student
+  els.gameover.classList.add("hidden");
+  els.startOverlay.classList.remove("hidden");
+  els.startBtn.disabled = false;
+  els.error.textContent = "";
+  setStartStatus("Camera is off · enter your name to play");
+  state = "boot"; // back to the pre-start state; onStart() runs the full flow
+  game.demo = true;
+  game.startDemo();
+  updateTimer(90);
 }
 
 /* ---------- Global leaderboard (with localStorage fallback) ---------- */
@@ -259,10 +329,16 @@ async function mintSession() {
     const r = await apiFetch("/api/session", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: playerName }),
+      // RETRY presents the existing playerToken (same player, NEW session);
+      // without one the server mints a fresh identity (NEW GAME / first visit).
+      body: JSON.stringify(playerToken ? { name: playerName, playerToken } : { name: playerName }),
     });
     if (r.ok && r.data && r.data.sessionId) {
       sessionId = r.data.sessionId;
+      if (r.data.playerToken) {
+        playerToken = r.data.playerToken;
+        try { sessionStorage.setItem(TOKEN_KEY, playerToken); } catch {}
+      }
       backendUp = true;
       return true;
     }
@@ -285,6 +361,7 @@ async function submitScore(report) {
     bee: report.bee ?? 0,
     eco: report.eco ?? 0,
   };
+  if (playerToken) payload.playerToken = playerToken; // same-player identity for personal-best tracking
   try {
     let r = await apiFetch("/api/scores", {
       method: "POST",
@@ -309,6 +386,7 @@ async function submitScore(report) {
       const rank = r.data.rank ? ` · rank #${r.data.rank} today` : "";
       els.submitNote.textContent = `🌍 Submitted to the global board — ${r.data.score} pts${rank}`;
       toast(`🌍 Global score: ${r.data.score}${rank}`);
+      setBestNote(r.data.best ?? null, !!r.data.newBest);
       // Cache-bypassing refresh so the just-submitted entry shows immediately
       // instead of the up-to-15s-stale edge-cached board.
       loadBoard({ fresh: true });
@@ -326,6 +404,12 @@ async function submitScore(report) {
 
 function saveLocalFallback(report) {
   backendUp = false;
+  // Offline personal best: best score among this device's same-name entries.
+  const prevBest = store.entries
+    .filter((e) => e.name === (playerName || "Anonymous Bee"))
+    .reduce((m, e) => Math.max(m, e.score), 0) || null;
+  const newBest = prevBest == null || report.score > prevBest;
+  setBestNote(newBest ? report.score : prevBest, newBest);
   store.entries.push({ name: playerName || "Anonymous Bee", score: report.score });
   store.entries.sort((a, b) => b.score - a.score);
   store.entries = store.entries.slice(0, 50);

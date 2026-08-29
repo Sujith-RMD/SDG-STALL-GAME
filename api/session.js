@@ -1,16 +1,22 @@
 /*
  * POST /api/session
- * Body: { "name": "PlayerName" }
- * -> 200 { "sessionId": "<32 hex chars>" }
+ * Body: { "name": "PlayerName", "playerToken"?: "<32 hex chars>" }
+ * -> 200 { "sessionId": "<32 hex chars>", "playerToken": "<32 hex chars>" }
  *
  * Validates the name server-side, mints a cryptographically random session
  * id and stores the session in Redis with a 15 minute TTL. The game sends
  * this id back with the score submission in POST /api/scores.
+ *
+ * playerToken (Step 4): the server-issued identity that groups an individual
+ * player's retry attempts into ONE personal-best leaderboard entry. A client
+ * may present an existing token (RETRY flow — new session, same player) or
+ * omit it (NEW GAME flow — a fresh identity is minted). It is stored in the
+ * session record so score submissions can be bound to it.
  */
 
 const crypto = require("node:crypto");
 const { redis, RedisUnavailableError } = require("./_lib/redis");
-const { cleanName } = require("./_lib/validate");
+const { cleanName, isPlayerToken } = require("./_lib/validate");
 const { readJsonBody, httpError, isErrorHttp } = require("./_lib/http");
 const { enforceRateLimit, limitFromEnv, DEFAULTS } = require("./_lib/ratelimit");
 
@@ -44,14 +50,29 @@ module.exports = async function handler(req, res) {
     }))) return;
 
     const sessionId = crypto.randomBytes(16).toString("hex");
-    const record = JSON.stringify({ name, createdAt: Date.now() });
+
+    /*
+     * Player identity for the retry flow: reuse the client's existing token
+     * (RETRY) or mint a new one (NEW GAME / first visit). Format-checked —
+     * it is user-supplied input like the name.
+     */
+    let playerToken;
+    if (body.playerToken === undefined || body.playerToken === null || body.playerToken === "") {
+      playerToken = crypto.randomBytes(16).toString("hex");
+    } else if (isPlayerToken(String(body.playerToken))) {
+      playerToken = String(body.playerToken);
+    } else {
+      throw httpError(400, "Invalid playerToken");
+    }
+
+    const record = JSON.stringify({ name, playerToken, createdAt: Date.now() });
 
     await redis([
       ["SET", `session:${sessionId}`, record, "EX", String(SESSION_TTL_SECONDS)],
     ]);
 
     res.setHeader("Cache-Control", "no-store");
-    res.status(200).json({ sessionId });
+    res.status(200).json({ sessionId, playerToken });
   } catch (err) {
     handleError(res, err);
   }
