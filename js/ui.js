@@ -23,14 +23,14 @@ export const els = {
   impEco: $("imp-eco"),
   score: $("final-score"),
   fact: $("fact-text"),
-  name: $("player-name"),
-  saveBtn: $("save-score"),
+  nameStart: $("player-name-start"),
+  submitNote: $("submit-note"),
   againBtn: $("play-again"),
   board: $("leaderboard"),
   aggGames: $("agg-games"),
   aggFlowers: $("agg-flowers"),
   aggEco: $("agg-eco"),
-  reset: $("reset-board"),
+  boardStatus: $("board-status"),
   toastEl: $("toast"),
   fsBtn: $("fs-btn"),
   muteBtn: $("mute-btn"),
@@ -75,8 +75,7 @@ export function showGameOver(r, tierTitle, fact) {
   els.impEco.textContent = `${Math.round(r.eco)}%`;
   els.score.textContent = r.score;
   els.fact.textContent = fact;
-  els.name.value = "";
-  els.saveBtn.disabled = false;
+  els.submitNote.textContent = "";
   els.gameover.classList.remove("hidden");
 }
 
@@ -91,15 +90,22 @@ export function updateHUD(bee, eco, flowers) {
 
 const MEDALS = ["🥇", "🥈", "🥉"];
 
-export function renderBoard(entries, totals) {
+/*
+ * Render the Champions Board. `entries` comes either from the global API
+ * (name, score, flowers, eco, rank) or from the localStorage fallback
+ * ({ name, score } — extra fields render as 0).
+ * `agg` = { games, flowers, avgEco }.
+ */
+export function renderBoard(entries, agg) {
+  const a = agg || {};
   els.board.innerHTML = "";
-  if (entries.length === 0) {
+  if (!entries || entries.length === 0) {
     const li = document.createElement("li");
     li.className = "empty";
     li.textContent = "No champions yet — be the first! 🐝";
     els.board.appendChild(li);
   } else {
-    entries.slice(0, 5).forEach((en, i) => {
+    entries.slice(0, 10).forEach((en, i) => {
       const li = document.createElement("li");
       const rank = document.createElement("span");
       rank.className = "rank";
@@ -112,9 +118,14 @@ export function renderBoard(entries, totals) {
       els.board.appendChild(li);
     });
   }
-  els.aggGames.textContent = totals.games;
-  els.aggFlowers.textContent = totals.flowers;
-  els.aggEco.textContent = `${totals.games ? Math.round(totals.sumEco / totals.games) : 0}%`;
+  els.aggGames.textContent = a.games ?? 0;
+  els.aggFlowers.textContent = a.flowers ?? 0;
+  els.aggEco.textContent = `${a.avgEco ?? 0}%`;
+}
+
+/* Persistent status line under the board (global-online / fallback notice). */
+export function setBoardStatus(text) {
+  els.boardStatus.textContent = text || "";
 }
 
 export function updateCombo(combo, mult) {

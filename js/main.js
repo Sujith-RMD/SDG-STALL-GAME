@@ -1,7 +1,7 @@
 import { Ecosystem } from "./ecosystem.js";
 import { VisionManager } from "./vision.js";
 import { Game } from "./game.js";
-import { els, toast, setStartStatus, startError, hideStart, showGameOver, updateHUD, updateTimer, renderBoard, drawPreview, toggleFullscreen, updateCombo } from "./ui.js";
+import { els, toast, setStartStatus, startError, hideStart, showGameOver, updateHUD, updateTimer, renderBoard, drawPreview, toggleFullscreen, updateCombo, setBoardStatus } from "./ui.js";
 
 const STORAGE_KEY = "pollinator-panic-v1";
 window.__boothBooted = false;
@@ -26,6 +26,13 @@ let prevGrace = 10;
 let lastCombo = -1;
 let lastMult = -1;
 let overAt = 0; // when the results screen appeared — gates pinch-to-restart
+
+// Global leaderboard state. backendUp: null = unknown, true/false once the
+// API has answered (or failed) at least once. All API failures degrade to
+// the localStorage fallback below — the game never crashes on them.
+let playerName = "";
+let sessionId = null;
+let backendUp = null;
 
 const eco = new Ecosystem();
 const game = new Game(els.canvas, eco);
@@ -54,7 +61,9 @@ function saveStore() {
   } catch {}
 }
 
-renderBoard(store.entries, store.totals);
+renderBoard(store.entries, localAgg());
+loadBoard(); // upgrade to the global board as soon as the API answers
+setInterval(loadBoard, 30000); // keep the board fresh while players watch
 game.startDemo(); // attract loop runs behind the start overlay
 
 function waitFor(pred, timeoutMs) {
@@ -73,16 +82,8 @@ function waitFor(pred, timeoutMs) {
 }
 
 els.startBtn.addEventListener("click", onStart);
-els.saveBtn.addEventListener("click", onSaveScore);
 els.againBtn.addEventListener("click", () => {
   if (state === "over") startGame();
-});
-els.reset.addEventListener("click", () => {
-  store.entries = [];
-  store.totals = { games: 0, flowers: 0, sumEco: 0 };
-  saveStore();
-  renderBoard(store.entries, store.totals);
-  toast("Champions board cleared 🧹");
 });
 els.fsBtn.addEventListener("click", toggleFullscreen);
 
@@ -109,8 +110,22 @@ els.canvas.addEventListener("pointerdown", (e) => {
 });
 
 async function onStart() {
+  const raw = typeof els.nameStart.value === "string" ? els.nameStart.value : "";
+  const name = raw.trim().slice(0, 14);
+  if (!name) {
+    els.error.textContent = "Enter your name first — it goes on the Champions Board 🐝";
+    return;
+  }
+  playerName = name;
+  els.error.textContent = "";
   els.startBtn.disabled = true;
-  setStartStatus("Requesting camera…");
+  setStartStatus("Connecting to the global board…");
+  sessionId = null;
+  if (await mintSession()) {
+    setStartStatus("Connected to the global board ✅");
+  } else {
+    setStartStatus("Global board offline — scores will stay on this device");
+  }
   game.demo = false;
   game.entities = [];
   game.particles = [];
@@ -161,8 +176,9 @@ function handleAction(fromKey = false) {
   } else if (state === "over") {
     // Hands-only restart for the next challenger: ignore pinches for a short
     // grace period so the death flap can't skip the results, and never
-    // restart while the player is typing their name.
-    const typing = document.activeElement === els.name;
+    // restart while the player is typing in any input.
+    const el = document.activeElement;
+    const typing = !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
     const settled = performance.now() - overAt > 2500;
     if (!typing && (fromKey || settled)) startGame();
   }
@@ -203,21 +219,135 @@ function endGame() {
     score: game.liveScore + Math.round(eco.value * 2),
   };
   showGameOver(pendingReport, tierTitle(pendingReport.eco), FACTS[Math.floor(Math.random() * FACTS.length)]);
+
+  // Auto-submit: no save button. Global when available, local otherwise.
+  if (sessionId) {
+    els.submitNote.textContent = "🌍 Submitting to the global board…";
+    submitScore(pendingReport);
+  } else {
+    saveLocalFallback(pendingReport);
+  }
 }
 
-function onSaveScore() {
-  if (!pendingReport) return;
-  const rawName = els.name.value.trim().slice(0, 14) || "Anonymous Bee";
-  store.entries.push({ name: rawName, score: pendingReport.score });
+/* ---------- Global leaderboard (with localStorage fallback) ---------- */
+
+function localAgg() {
+  const t = store.totals;
+  return { games: t.games, flowers: t.flowers, avgEco: t.games ? Math.round(t.sumEco / t.games) : 0 };
+}
+
+async function apiFetch(path, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(path, { ...options, signal: controller.signal });
+    let data = {};
+    try {
+      data = await res.json();
+    } catch {}
+    return { ok: res.ok, status: res.status, data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function mintSession() {
+  try {
+    const r = await apiFetch("/api/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: playerName }),
+    });
+    if (r.ok && r.data && r.data.sessionId) {
+      sessionId = r.data.sessionId;
+      backendUp = true;
+      return true;
+    }
+  } catch {}
+  sessionId = null;
+  backendUp = false;
+  return false;
+}
+
+async function submitScore(report) {
+  const payload = {
+    sessionId,
+    durationMs: Math.round((game.elapsed || 0) * 1000),
+    flowers: report.flowers ?? 0,
+    cleanup: report.cleanup ?? 0,
+    natives: report.natives ?? 0,
+    pipes: report.pipes ?? 0,
+    closeCalls: report.closeCalls ?? 0,
+    bestCombo: report.bestCombo ?? 0,
+    bee: report.bee ?? 0,
+    eco: report.eco ?? 0,
+  };
+  try {
+    let r = await apiFetch("/api/scores", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    // Session expired mid-game — mint a fresh one and retry exactly once.
+    if (r.status === 404 && (await mintSession())) {
+      payload.sessionId = sessionId;
+      r = await apiFetch("/api/scores", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    }
+
+    if (r.ok && typeof r.data.score === "number") {
+      backendUp = true;
+      pendingReport.score = r.data.score; // server is the score authority
+      els.score.textContent = r.data.score;
+      const rank = r.data.rank ? ` · rank #${r.data.rank} today` : "";
+      els.submitNote.textContent = `🌍 Submitted to the global board — ${r.data.score} pts${rank}`;
+      toast(`🌍 Global score: ${r.data.score}${rank}`);
+      loadBoard();
+      return;
+    }
+    if (r.status === 409) {
+      els.submitNote.textContent = "🌍 This run was already submitted.";
+      return;
+    }
+    throw new Error(`score submit failed (${r.status})`);
+  } catch {
+    saveLocalFallback(report);
+  }
+}
+
+function saveLocalFallback(report) {
+  backendUp = false;
+  store.entries.push({ name: playerName || "Anonymous Bee", score: report.score });
   store.entries.sort((a, b) => b.score - a.score);
   store.entries = store.entries.slice(0, 50);
   store.totals.games += 1;
-  store.totals.flowers += pendingReport.flowers;
-  store.totals.sumEco += pendingReport.eco;
+  store.totals.flowers += report.flowers ?? 0;
+  store.totals.sumEco += report.eco ?? 0;
   saveStore();
-  renderBoard(store.entries, store.totals);
-  els.saveBtn.disabled = true;
-  toast(`🏆 ${rawName} entered the Champions Board!`);
+  setBoardStatus("Global leaderboard unreachable — showing this device's local scores.");
+  els.submitNote.textContent = "📴 Saved to the local board (global board unreachable).";
+  renderBoard(store.entries, localAgg());
+}
+
+async function loadBoard() {
+  try {
+    const r = await apiFetch("/api/leaderboard");
+    if (!r.ok) throw new Error("leaderboard fetch failed");
+    backendUp = true;
+    setBoardStatus("🌍 Live global board — shared across every device.");
+    renderBoard(r.data.entries || [], r.data.aggregates || { games: 0, flowers: 0, avgEco: 0 });
+  } catch {
+    if (backendUp !== true && store.entries.length === 0) {
+      setBoardStatus("");
+    } else if (backendUp === false) {
+      setBoardStatus("Global leaderboard unreachable — showing this device's local scores.");
+    }
+    renderBoard(store.entries, localAgg());
+  }
 }
 
 // Only touch the combo DOM when it actually changes — updateCombo() forces a

@@ -296,7 +296,7 @@ body {
 }
 .fact-card p { font-size: 13.5px; line-height: 1.5; color: #d7e6d8; text-align: left; }
 
-#player-name {
+#player-name-start {
   background: #ffffff0d;
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -308,7 +308,15 @@ body {
   outline: none;
   width: min(340px, 90%);
 }
-#player-name:focus { border-color: var(--accent); }
+#player-name-start:focus { border-color: var(--accent); }
+
+.board-status {
+  margin-top: 12px;
+  min-height: 16px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--amber);
+}
 
 .row { display: flex; gap: 12px; align-items: center; }
 

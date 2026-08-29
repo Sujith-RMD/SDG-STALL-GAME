@@ -57,7 +57,8 @@
           <span>☁️🧴 Avoid smog &amp; pesticide</span>
           <span>🗑️ Grab plastic (risky!)</span>
         </div>
-        <p id="vision-status" class="status-line">Camera is off · build 10</p>
+        <p id="vision-status" class="status-line">Camera is off · build 11</p>
+        <input id="player-name-start" maxlength="14" placeholder="Your name for the Champions Board" autocomplete="off" />
         <button id="start-btn" class="primary-btn" type="button">Start — enable camera</button>
         <p id="error-msg" class="error-msg"></p>
         <p class="fineprint">First launch downloads the hand-tracking AI (~10 MB). Spacebar or tap works as a backup flap.</p>
@@ -78,9 +79,8 @@
         </div>
         <div class="final-score">Impact Score · <b id="final-score">0</b></div>
         <div class="fact-card"><span>📌</span><p id="fact-text"></p></div>
-        <input id="player-name" maxlength="14" placeholder="Your name for the Champions Board" autocomplete="off" />
+        <p id="submit-note" class="status-line"></p>
         <div class="row">
-          <button id="save-score" class="primary-btn" type="button">🏆 Save to Champions Board</button>
           <button id="play-again" class="ghost-btn" type="button">▶ Play again (Space / pinch)</button>
         </div>
       </div>
@@ -94,7 +94,7 @@
         <div>🌱 avg restored <b id="agg-eco">0%</b></div>
         <div>🎮 <b id="agg-games">0</b> players</div>
       </div>
-      <button id="reset-board" class="ghost-btn small" type="button">Reset board</button>
+      <p id="board-status" class="board-status"></p>
       <p class="disclaimer">75% of food crops depend on pollinators.<br/>Every player here is learning why that matters. 🌍</p>
     </aside>
   </main>
