@@ -7,8 +7,15 @@
  * inside Vercel Serverless Functions and is never bundled for the browser.
  */
 
-const BASE_URL = process.env.UPSTASH_REDIS_REST_URL;
-const REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+/*
+ * Credentials from the Vercel Upstash Marketplace integration, which injects
+ * KV_REST_API_URL + KV_REST_API_TOKEN (the write token) automatically.
+ * Falls back to the plain Upstash console REST variables (UPSTASH_REDIS_REST_*)
+ * for manual setups and local .env.local files.
+ * Server-side only — these values must never reach frontend JavaScript.
+ */
+const BASE_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const REST_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
 
 class RedisUnavailableError extends Error {
   constructor(message) {
