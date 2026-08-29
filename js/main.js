@@ -25,6 +25,7 @@ let lastTickSec = -1;
 let prevGrace = 10;
 let lastCombo = -1;
 let lastMult = -1;
+let overAt = 0; // when the results screen appeared — gates pinch-to-restart
 
 const eco = new Ecosystem();
 const game = new Game(els.canvas, eco);
@@ -93,10 +94,12 @@ els.muteBtn.addEventListener("click", () => {
 });
 
 window.addEventListener("keydown", (e) => {
-  if (e.code === "Space") {
-    e.preventDefault();
-    handleAction(true);
-  }
+  if (e.code !== "Space") return;
+  // Don't hijack Space while the player is typing their name on the board.
+  const t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+  e.preventDefault();
+  handleAction(true);
 });
 
 // Tap / click anywhere on the game as a backup flap (mobile + mouse-friendly).
@@ -151,8 +154,18 @@ async function onStart() {
 
 function handleAction(fromKey = false) {
   if (state === "ready") startGame();
-  else if (state === "playing") game.flap();
-  else if (fromKey && state === "over") startGame();
+  else if (state === "playing") {
+    // The game pauses while the hand is out of frame; don't let flaps queued
+    // during the pause fling the bee upward the moment it resumes.
+    if (!vision.lostFor(1600)) game.flap();
+  } else if (state === "over") {
+    // Hands-only restart for the next challenger: ignore pinches for a short
+    // grace period so the death flap can't skip the results, and never
+    // restart while the player is typing their name.
+    const typing = document.activeElement === els.name;
+    const settled = performance.now() - overAt > 2500;
+    if (!typing && (fromKey || settled)) startGame();
+  }
 }
 
 vision.onPinch = () => handleAction(false);
@@ -179,6 +192,7 @@ function tierTitle(ecoVal) {
 
 function endGame() {
   state = "over";
+  overAt = performance.now();
   game.music.stop();
   toast(game.timeUp ? "⏱ Time's up — next challenger!" : "💀 The bee has fallen…");
   pendingReport = {
@@ -259,7 +273,7 @@ function loop(now) {
   game.render();
   drawPreview(previewCtx, els.video, vision);
 
-requestAnimationFrame(loop);
-window.__boothBooted = true;
+  requestAnimationFrame(loop);
+  window.__boothBooted = true;
 }
 requestAnimationFrame(loop);

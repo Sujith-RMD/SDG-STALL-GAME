@@ -70,10 +70,28 @@ export class VisionManager {
 
     // Frames spent reopening.
     this.releaseFrames = 0;
+
+    // Gap + baseline captured when the last flap fired — lets re-arm be
+    // relative to the player's own pinch depth instead of a fixed threshold.
+    this.fireGap = null;
+    this.fireBaseline = null;
+
+    // Guards against overlapping landmarker re-creations.
+    this.recreating = false;
   }
 
   async init(video) {
     this.video = video;
+
+    /*
+     * Retries (e.g. after a failed calibration) used to request a second
+     * camera stream and leak the first one — release it before asking
+     * for a new one.
+     */
+    if (this.stream) {
+      this.stream.getTracks().forEach((t) => t.stop());
+      this.stream = null;
+    }
 
     const stream =
       await navigator.mediaDevices.getUserMedia({
@@ -87,6 +105,7 @@ export class VisionManager {
     );
 
     video.srcObject = stream;
+    this.stream = stream;
 
     await new Promise((resolve) => {
       if (video.readyState >= 1) {
@@ -141,6 +160,14 @@ export class VisionManager {
   }
 
   async recreate() {
+    /*
+     * detect() triggers recreate at two failure marks; if a previous
+     * recreation is still awaiting its model, don't start a second one —
+     * two racing recreations can toggle GPU/CPU twice and land on the
+     * delegate that was failing.
+     */
+    if (this.recreating) return;
+    this.recreating = true;
     try {
       const nextDelegate =
         this.usedDelegate === "GPU"
@@ -172,6 +199,8 @@ export class VisionManager {
       );
 
       this.aiError = true;
+    } finally {
+      this.recreating = false;
     }
   }
 
@@ -252,6 +281,13 @@ export class VisionManager {
       this.releaseFrames = 0;
 
       this.localGapBaseline = null;
+
+      /*
+       * Drop the stale gap so the first frame after the hand returns
+       * starts from a fresh measurement instead of blending with an
+       * old value.
+       */
+      this.gap = null;
 
       return;
     }
@@ -371,6 +407,9 @@ export class VisionManager {
         this.pinchDelta = 0;
         this.pinchFrames = 0;
         this.releaseFrames = 0;
+
+        this.fireGap = null;
+        this.fireBaseline = null;
 
         this.recomputeLine();
 
@@ -593,9 +632,28 @@ export class VisionManager {
      * Fingers have to separate again before another flap.
      */
 
+    /*
+     * A purely fixed REARM_THRESHOLD misses players whose whole
+     * open-pinch range sits below it (hand angle, pinch style,
+     * distance from the camera) — after one flap the bee would never
+     * flap again. So also re-arm relative to the last pinch's actual
+     * depth: reopening at least max(0.08, half the closing that was
+     * measured) counts as "fingers apart" again.
+     */
+    const relativeRearm =
+      this.fireGap != null &&
+      this.gap - this.fireGap >=
+        Math.max(
+          0.08,
+          0.5 *
+            ((this.fireBaseline ?? this.gap) -
+              this.fireGap)
+        );
+
     if (
       this.gap >
-      REARM_THRESHOLD
+        REARM_THRESHOLD ||
+      relativeRearm
     ) {
       this.armed = true;
 
@@ -606,6 +664,10 @@ export class VisionManager {
       this.pinchDelta = 0;
 
       this.pinchFrames = 0;
+
+      this.fireGap = null;
+
+      this.fireBaseline = null;
 
       this.releaseFrames += 1;
 
@@ -721,6 +783,16 @@ export class VisionManager {
        */
       this.armed = false;
 
+      /*
+       * Remember how deep this pinch was, so re-arm can be
+       * relative to the player's own pinch range.
+       */
+      this.fireGap =
+        this.gap;
+
+      this.fireBaseline =
+        this.localGapBaseline;
+
       this.lastFire =
         nowMs;
 
@@ -814,6 +886,10 @@ export class VisionManager {
     this.pinchFrames = 0;
 
     this.releaseFrames = 0;
+
+    this.fireGap = null;
+
+    this.fireBaseline = null;
 
     this.armed = false;
 

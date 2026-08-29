@@ -91,37 +91,40 @@ const BASS = [130.81, 0, 196, 0, 220, 0, 174.61, 0];
 const PAD = [261.63, 329.63, 392.0, 329.63]; // C E G — warm major-triad pad
 const ARP = [1046.5, 1318.51, 1567.98, 1318.51]; // C6 E6 G6 — high sparkle
 
+// One AudioContext shared by SFX and music — browsers cap contexts per page,
+// and a single clock keeps effects and the music grid in sync.
+let sharedCtx = null;
+function audioCtx() {
+  if (!sharedCtx) {
+    try {
+      sharedCtx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch {
+      sharedCtx = null;
+    }
+  }
+  if (sharedCtx && sharedCtx.state === "suspended") sharedCtx.resume();
+  return sharedCtx;
+}
+
 class Sfx {
   constructor() {
-    this.ctx = null;
     this.music = null;
-  }
-
-  ensure() {
-    if (!this.ctx) {
-      try {
-        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-      } catch {
-        this.ctx = null;
-      }
-    }
-    if (this.ctx && this.ctx.state === "suspended") this.ctx.resume();
-    return !!this.ctx;
   }
 
   tone(f, dur, type = "sine", gain = 0.07, slide = 0) {
     if (this.music && this.music.muted) return;
-    if (!this.ensure()) return;
-    const t = this.ctx.currentTime;
-    const o = this.ctx.createOscillator();
-    const g = this.ctx.createGain();
+    const ctx = audioCtx();
+    if (!ctx) return;
+    const t = ctx.currentTime;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
     o.type = type;
     o.frequency.setValueAtTime(f, t);
     if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(40, f + slide), t + dur);
     g.gain.setValueAtTime(gain, t);
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     o.connect(g);
-    g.connect(this.ctx.destination);
+    g.connect(ctx.destination);
     o.start(t);
     o.stop(t + dur + 0.02);
   }
@@ -149,7 +152,6 @@ class Sfx {
 
 class MusicBox {
   constructor() {
-    this.ctx = null;
     this.timer = null;
     this.step = 0;
     this.nextTime = 0;
@@ -157,21 +159,10 @@ class MusicBox {
     this.level = 0; // 0..3, follows ecosystem tier; more layers as the land heals
   }
 
-  ensure() {
-    if (!this.ctx) {
-      try {
-        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-      } catch {
-        this.ctx = null;
-      }
-    }
-    if (this.ctx && this.ctx.state === "suspended") this.ctx.resume();
-    return !!this.ctx;
-  }
-
   start() {
-    if (!this.ensure() || this.timer) return;
-    this.nextTime = this.ctx.currentTime + 0.15;
+    const ctx = audioCtx();
+    if (!ctx || this.timer) return;
+    this.nextTime = ctx.currentTime + 0.15;
     this.step = 0;
     this.timer = setInterval(() => this.schedule(), 90);
   }
@@ -188,22 +179,27 @@ class MusicBox {
   }
 
   note(f, t, dur, type, gain) {
-    const o = this.ctx.createOscillator();
-    const g = this.ctx.createGain();
+    const ctx = sharedCtx;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
     o.type = type;
     o.frequency.value = f;
     g.gain.setValueAtTime(gain, t);
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     o.connect(g);
-    g.connect(this.ctx.destination);
+    g.connect(ctx.destination);
     o.start(t);
     o.stop(t + dur + 0.05);
   }
 
   schedule() {
-    if (!this.ctx) return;
+    const ctx = sharedCtx;
+    if (!ctx) return;
     const STEP = 0.32;
-    while (this.nextTime < this.ctx.currentTime + 0.35) {
+    // Timers get throttled when the tab hides or the booth laptop dozes off.
+    // Jump to "now" instead of dumping a burst of overdue notes at once.
+    if (this.nextTime < ctx.currentTime - 0.25) this.nextTime = ctx.currentTime + 0.15;
+    while (this.nextTime < ctx.currentTime + 0.35) {
       if (!this.muted) {
         const i = this.step % 16;
         const lvl = this.level; // 0..3 — rises as the ecosystem recovers
