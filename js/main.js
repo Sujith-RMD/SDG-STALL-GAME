@@ -61,8 +61,11 @@ function saveStore() {
   } catch {}
 }
 
-renderBoard(store.entries, localAgg());
-loadBoard(); // upgrade to the global board as soon as the API answers
+// Global board first: show a neutral loading state and fetch immediately.
+// localStorage is ONLY a fallback for when the global API genuinely fails —
+// never the initial render.
+setBoardStatus("Loading global leaderboard…");
+loadBoard();
 setInterval(loadBoard, 30000); // keep the board fresh while players watch
 game.startDemo(); // attract loop runs behind the start overlay
 
@@ -360,11 +363,13 @@ async function loadBoard({ fresh = false } = {}) {
     renderBoard(r.data.entries || [], r.data.aggregates || { games: 0, flowers: 0, avgEco: 0 });
   } catch {
     if (requestId !== boardRequestId) return; // superseded by a newer load
-    if (backendUp !== true && store.entries.length === 0) {
-      setBoardStatus("");
-    } else if (backendUp === false) {
-      setBoardStatus("Global leaderboard unreachable — showing this device's local scores.");
-    }
+    if (backendUp === true) return; // global board already loaded — never overwrite it with stale local data
+    // Genuine failure before the global board ever loaded: local fallback.
+    setBoardStatus(
+      store.entries.length > 0
+        ? "Global leaderboard unreachable — showing this device's local scores."
+        : "Global leaderboard unreachable — no local scores on this device yet."
+    );
     renderBoard(store.entries, localAgg());
   }
 }
