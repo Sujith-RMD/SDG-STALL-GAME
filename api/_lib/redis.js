@@ -45,22 +45,41 @@ async function redis(commands) {
     );
   }
 
+  /*
+   * Pipeline endpoint per the official Upstash REST API:
+   *   POST {REST_URL}/pipeline  with a two-dimensional JSON array body,
+   *   each row being [command, arg0, arg1, ...]. All arguments are
+   *   serialized as strings, which is the documented format.
+   * (Posting to the bare REST_URL root is not a valid route and returns 400.)
+   */
+  const pipelineUrl = `${BASE_URL.replace(/\/+$/, "")}/pipeline`;
+
   let res;
   try {
-    res = await fetch(BASE_URL, {
+    res = await fetch(pipelineUrl, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${REST_TOKEN}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(commands),
+      body: JSON.stringify(commands.map((cmd) => cmd.map((arg) => String(arg)))),
     });
   } catch {
     throw new RedisUnavailableError("Could not reach Upstash Redis");
   }
 
   if (!res.ok) {
-    throw new RedisUnavailableError(`Upstash Redis responded with HTTP ${res.status}`);
+    /*
+     * Log Upstash's own error body (truncated) so failures are diagnosable
+     * from Vercel runtime logs. Never logs the URL or token.
+     */
+    let detail = "";
+    try {
+      detail = (await res.text()).slice(0, 300);
+    } catch {}
+    throw new RedisUnavailableError(
+      `Upstash Redis responded with HTTP ${res.status}${detail ? `: ${detail}` : ""}`
+    );
   }
 
   let data;
