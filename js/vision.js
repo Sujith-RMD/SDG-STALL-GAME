@@ -502,10 +502,13 @@ export class VisionManager {
       0.52;
 
     /*
-     * Require several consecutive frames.
+     * Require consecutive frames. 2 keeps jitter out (the closing motion
+     * AND the 0.065 distance must both hold twice in a row) while adding
+     * only ~1 video frame of latency — 3 made fast double pinches feel
+     * unresponsive.
      */
     const REQUIRED_PINCH_FRAMES =
-      3;
+      2;
 
     /*
      * ========================================================
@@ -669,6 +672,26 @@ export class VisionManager {
 
       this.fireBaseline = null;
 
+      /*
+       * Fast double-pinch support: on a relative re-arm, raise the baseline
+       * to the reopen apex immediately. Otherwise the next close is measured
+       * against the stale low baseline, the required 0.065 closing distance
+       * is never reached on a shallow reopen, and the second pinch only
+       * fires after an extra-deep re-close.
+       */
+      if (
+        relativeRearm
+      ) {
+        this.localGapBaseline =
+          Math.max(
+            this.localGapBaseline,
+            Math.min(
+              1.5,
+              this.gap
+            )
+          );
+      }
+
       this.releaseFrames += 1;
 
       /*
@@ -771,12 +794,17 @@ export class VisionManager {
      * ========================================================
      */
 
+    /*
+     * Small burst guard only. The old 180 ms lockout was the main reason the
+     * second flap of a fast double pinch fired late — the re-arm rule (must
+     * reopen about half the pinch depth) already prevents double fires.
+     */
     if (
       this.armed &&
       shouldFire &&
       nowMs -
         this.lastFire >
-        180
+        70
     ) {
       /*
        * One pinch = one flap.
