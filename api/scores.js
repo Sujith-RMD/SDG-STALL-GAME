@@ -15,10 +15,18 @@ const { redis, RedisUnavailableError } = require("./_lib/redis");
 const { validateStats } = require("./_lib/validate");
 const { CAPS, todayKey, computeScore } = require("./_lib/score");
 const { readJsonBody, httpError, isErrorHttp } = require("./_lib/http");
+const { enforceRateLimit, limitFromEnv, DEFAULTS } = require("./_lib/ratelimit");
 
 module.exports = async function handler(req, res) {
   try {
     if (req.method !== "POST") throw httpError(405, "Method not allowed");
+
+    /*
+     * Per-IP abuse limit — runs before session lookup so spam does no
+     * Redis work. A 429 here never consumes the session's one-submission
+     * slot; that claim happens later, atomically via SET NX.
+     */
+    if (!(await enforceRateLimit(req, res, "scores", limitFromEnv("RATE_LIMIT_SCORES_PER_HOUR", DEFAULTS.scoresPerIpPerHour), 3600))) return;
 
     const body = await readJsonBody(req);
     const check = validateStats(body, CAPS);

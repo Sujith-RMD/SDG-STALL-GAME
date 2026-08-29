@@ -14,10 +14,18 @@
 const { redis, RedisUnavailableError } = require("./_lib/redis");
 const { todayKey } = require("./_lib/score");
 const { httpError, isErrorHttp } = require("./_lib/http");
+const { enforceRateLimit, limitFromEnv, DEFAULTS } = require("./_lib/ratelimit");
 
 module.exports = async function handler(req, res) {
   try {
     if (req.method !== "GET") throw httpError(405, "Method not allowed");
+
+    /*
+     * Per-IP origin limit. Edge-cached responses (s-maxage=15) never reach
+     * this function, so the limiter only sees real origin hits — normal
+     * stall polling stays far under it. Edge caching itself is unchanged.
+     */
+    if (!(await enforceRateLimit(req, res, "leaderboard", limitFromEnv("RATE_LIMIT_LEADERBOARD_PER_MIN", DEFAULTS.leaderboardPerIpPerMin), 60))) return;
 
     const period = req.query?.period === "today" ? "today" : "all";
     const key = period === "today" ? `lb:day:${todayKey()}` : "lb:all";

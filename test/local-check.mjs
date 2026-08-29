@@ -1,5 +1,5 @@
 /*
- * Step 1 local verification — no credentials required.
+ * Step 1 + Step 2 (rate limiting) local verification — no credentials required.
  *
  * Runs the REAL api handlers end-to-end against an in-memory Redis fake
  * (injected through api/_lib/redis.js's test override), covering:
@@ -16,8 +16,9 @@ import { PassThrough } from "node:stream";
 import assert from "node:assert/strict";
 
 const require = createRequire(import.meta.url);
-const { _setOverride } = require("../api/_lib/redis.js");
+const { _setOverride, redis } = require("../api/_lib/redis.js");
 const { computeScore } = require("../api/_lib/score.js");
+const { enforceRateLimit } = require("../api/_lib/ratelimit.js");
 const sessionHandler = require("../api/session.js");
 const scoresHandler = require("../api/scores.js");
 const leaderboardHandler = require("../api/leaderboard.js");
@@ -119,6 +120,12 @@ function setOverrideFake() {
           entry(k).exp = Date.now() + Number(sec) * 1000;
           return 1;
         }
+        case "TTL": {
+          purge(cmd[1]);
+          const e = store.get(cmd[1]);
+          if (!e) return -2;
+          return e.exp ? Math.max(0, Math.ceil((e.exp - Date.now()) / 1000)) : -1;
+        }
         default:
           throw new Error(`fake redis: unsupported command ${op}`);
       }
@@ -127,8 +134,11 @@ function setOverrideFake() {
 }
 
 /* ---------------- mocks ---------------- */
-function mockReq({ method = "POST", body = undefined, query = {} } = {}) {
-  return { method, body, query, headers: {} };
+function mockReq({ method = "POST", body = undefined, query = {}, headers = {} } = {}) {
+  return { method, body, query, headers };
+}
+function clearFakeStore() {
+  store.clear(); // simulates a wiped Redis — proves limiter state is not in process memory
 }
 function mockRes() {
   return {
@@ -331,6 +341,140 @@ _setOverride(null);
   const res = await call(sessionHandler, mockReq({ body: { name: "Bee" } }));
   assert.equal(res.statusCode, 503);
   ok("backend failing at runtime -> 503 (never 500/crash)");
+}
+
+/* ==================== Step 2: rate limiting ==================== */
+/* The limiter state lives in Redis (the fake store), so a fresh fake
+ * keeps the per-IP budgets from the Step 1 checks irrelevant here. The
+ * Step 2 checks use dedicated IPs/keys to stay independent of Step 1
+ * traffic and of each other. */
+setOverrideFake();
+
+/* ---------------- 7. fixed-window core: allow, exhaust, 429, Retry-After -- */
+{
+  const req = mockReq({ headers: { "x-real-ip": "7.7.7.7" } });
+  const r1 = mockRes(); const a1 = await enforceRateLimit(req, r1, "test-direct", 2, 60);
+  const r2 = mockRes(); const a2 = await enforceRateLimit(req, r2, "test-direct", 2, 60);
+  const r3 = mockRes(); const a3 = await enforceRateLimit(req, r3, "test-direct", 2, 60);
+  assert.ok(a1 && a2, "requests below the limit succeed");
+  assert.equal(a1.remaining, 1);
+  assert.equal(a2.remaining, 0);
+  assert.equal(a3, null, "request exceeding the limit is blocked");
+  assert.equal(r3.statusCode, 429);
+  const ra = Number(r3.headers["retry-after"]);
+  assert.ok(Number.isFinite(ra) && ra >= 1 && ra <= 60, "Retry-After present and sane");
+  assert.equal(r3.body.error, "Too many requests. Please try again later.");
+  assert.equal(r3.headers["cache-control"], "no-store", "429 is never cached");
+  ok("limiter: below-limit allowed, exceeding -> 429 + Retry-After + clean JSON");
+}
+
+/* ---------------- 8. counters live in Redis, not process memory ----------- */
+{
+  const req = mockReq({ headers: { "x-real-ip": "7.7.7.7" } });
+  const blocked = mockRes();
+  assert.equal(await enforceRateLimit(req, blocked, "test-direct", 2, 60), null, "still locked");
+  clearFakeStore(); // simulate a wiped Redis
+  const fresh = mockRes();
+  const a = await enforceRateLimit(req, fresh, "test-direct", 2, 60);
+  assert.ok(a, "clearing Redis resets the limiter (state was in Redis)");
+  ok("counters are shared through Redis, not process memory");
+}
+
+/* ---------------- 9. independent IPs -------------------------------------- */
+{
+  const ipA = mockReq({ headers: { "x-real-ip": "7.7.7.7" } }); // count 1 after check 8
+  const ipB = mockReq({ headers: { "x-real-ip": "8.8.8.8" } });
+  const ra2 = mockRes(); const a2 = await enforceRateLimit(ipA, ra2, "test-direct", 2, 60);
+  assert.ok(a2, "IP A hits its second allowed request");
+  const ra3 = mockRes();
+  assert.equal(await enforceRateLimit(ipA, ra3, "test-direct", 2, 60), null, "IP A now exhausted");
+  const rb1 = mockRes();
+  assert.ok(await enforceRateLimit(ipB, rb1, "test-direct", 2, 60), "IP B unaffected by IP A");
+  ok("multiple IPs have independent limits");
+}
+
+/* ---------------- 10. leaderboard endpoint limit (120/min per IP) --------- */
+{
+  const req = mockReq({ method: "GET", query: {}, headers: { "x-real-ip": "9.9.9.9" } });
+  let last = null;
+  for (let i = 0; i < 120; i++) last = await call(leaderboardHandler, req);
+  assert.equal(last.statusCode, 200, "requests at the limit succeed (120/min)");
+  const blocked = await call(leaderboardHandler, req);
+  assert.equal(blocked.statusCode, 429);
+  assert.ok(Number(blocked.headers["retry-after"]) >= 1);
+  assert.equal(blocked.body.error, "Too many requests. Please try again later.");
+  ok("/api/leaderboard per-IP limit: 120 OK, 121st -> 429 with Retry-After");
+}
+
+/* ---------------- 11. each endpoint has its own budget -------------------- */
+{
+  // 9.9.9.9 is exhausted on the LEADERBOARD route only.
+  const s = await call(sessionHandler, mockReq({ body: { name: "RateLimit" }, headers: { "x-real-ip": "9.9.9.9" } }));
+  assert.equal(s.statusCode, 200, "session endpoint has its own limit");
+  const stats = statsFor({
+    sessionId: s.body.sessionId, flowers: 5, cleanup: 2, natives: 1,
+    pipes: 15, closeCalls: 3, bestCombo: 2, bee: 90, eco: 70,
+  });
+  const sc = await call(scoresHandler, mockReq({ body: stats, headers: { "x-real-ip": "9.9.9.9" } }));
+  assert.equal(sc.statusCode, 200, "scores endpoint has its own limit");
+  ok("per-endpoint limits are independent (leaderboard 429 does not block session/scores)");
+}
+
+/* ---------------- 12. cross-IP independence at endpoint level ------------- */
+{
+  const res = await call(leaderboardHandler, mockReq({ method: "GET", query: {}, headers: { "x-real-ip": "5.5.5.5" } }));
+  assert.equal(res.statusCode, 200, "another IP still gets 200");
+  ok("exhausting one IP's leaderboard budget leaves other IPs untouched");
+}
+
+/* ---------------- 13. global daily session circuit breaker ---------------- */
+{
+  const key = "ratelimit:global-sessions:global";
+  const [curRaw] = await redis([["GET", key]]);
+  const current = Number(curRaw || 0);
+  process.env.GLOBAL_DAILY_SESSION_LIMIT = String(current + 1); // lazy-read per request
+  const okRes = await call(sessionHandler, mockReq({ body: { name: "CapOK" } }));
+  assert.equal(okRes.statusCode, 200, "session under the global cap succeeds");
+  const blockedRes = await call(sessionHandler, mockReq({ body: { name: "CapBlocked" } }));
+  assert.equal(blockedRes.statusCode, 429, "global cap rejects with 429");
+  assert.match(blockedRes.body.error, /capacity/);
+  assert.ok(Number(blockedRes.headers["retry-after"]) >= 1, "Retry-After until window reset");
+  delete process.env.GLOBAL_DAILY_SESSION_LIMIT;
+  const recovered = await call(sessionHandler, mockReq({ body: { name: "CapRecovered" } }));
+  assert.equal(recovered.statusCode, 200, "no permanent lockout — recovers after reset");
+  ok("global daily session cap: 429 at limit + Retry-After + auto-recovery");
+}
+
+/* ---------------- 14. simultaneous requests cannot bypass the limit ------- */
+{
+  const req = mockReq({ headers: { "x-real-ip": "6.6.6.6" } });
+  const results = await Promise.all(
+    Array.from({ length: 10 }, () => enforceRateLimit(req, mockRes(), "test-concurrent", 5, 60))
+  );
+  const allowed = results.filter(Boolean).length;
+  assert.equal(allowed, 5, "exactly 5 of 10 simultaneous requests allowed");
+  ok("atomic counter: 10 simultaneous requests, limit 5 -> exactly 5 allowed");
+}
+
+/* ---------------- 15. oversized requests still 413 ------------------------ */
+{
+  const viaBody = await call(sessionHandler, mockReq({ body: "x".repeat(5000) }));
+  assert.equal(viaBody.statusCode, 413, "preparsed oversized body -> 413");
+  const viaStream = await call(sessionHandler, streamReq("y".repeat(5000)));
+  assert.equal(viaStream.statusCode, 413, "streamed oversized body -> 413");
+  ok("oversized requests still rejected with 413 (4 KB limit intact)");
+}
+
+/* ---------------- 16. Redis down: limiter fails open, APIs stay clean ----- */
+{
+  _setOverride(null);
+  const lb = await call(leaderboardHandler, mockReq({ method: "GET", query: {}, headers: { "x-real-ip": "4.4.4.4" } }));
+  assert.equal(lb.statusCode, 503, "leaderboard degrades to clean 503, no crash");
+  const sess = await call(sessionHandler, mockReq({ body: { name: "DownCheck" } }));
+  assert.equal(sess.statusCode, 503, "session degrades to clean 503");
+  assert.notEqual(sess.statusCode, 429, "limiter failure must NOT 429 (fail-open)");
+  setOverrideFake();
+  ok("Redis failure: limiter fails open, endpoints return clean 503, never crash");
 }
 
 console.log(`\nALL ${passed} CHECKS PASSED ✅`);
