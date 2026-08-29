@@ -306,7 +306,9 @@ async function submitScore(report) {
       const rank = r.data.rank ? ` · rank #${r.data.rank} today` : "";
       els.submitNote.textContent = `🌍 Submitted to the global board — ${r.data.score} pts${rank}`;
       toast(`🌍 Global score: ${r.data.score}${rank}`);
-      loadBoard();
+      // Cache-bypassing refresh so the just-submitted entry shows immediately
+      // instead of the up-to-15s-stale edge-cached board.
+      loadBoard({ fresh: true });
       return;
     }
     if (r.status === 409) {
@@ -333,14 +335,31 @@ function saveLocalFallback(report) {
   renderBoard(store.entries, localAgg());
 }
 
-async function loadBoard() {
+let boardRequestId = 0;
+
+async function loadBoard({ fresh = false } = {}) {
+  // Ordering guard: only the most recently STARTED board load may render.
+  // Without this, a slow 30s poll (or a failed poll falling back to
+  // localStorage) resolving after the post-submission refresh could
+  // overwrite the fresh board with stale data.
+  const requestId = ++boardRequestId;
   try {
-    const r = await apiFetch("/api/leaderboard");
+    /*
+     * A fresh refresh (right after a successful submission) must not read
+     * the 15s edge cache — it would serve the board from BEFORE the
+     * submission. A unique query string makes the URL unique, so the CDN
+     * treats it as a cache miss and serves a live response. Regular
+     * polling keeps using the cached URL, preserving normal caching.
+     */
+    const url = fresh ? `/api/leaderboard?_=${Date.now()}` : "/api/leaderboard";
+    const r = await apiFetch(url);
     if (!r.ok) throw new Error("leaderboard fetch failed");
     backendUp = true;
+    if (requestId !== boardRequestId) return; // superseded by a newer load
     setBoardStatus("🌍 Live global board — shared across every device.");
     renderBoard(r.data.entries || [], r.data.aggregates || { games: 0, flowers: 0, avgEco: 0 });
   } catch {
+    if (requestId !== boardRequestId) return; // superseded by a newer load
     if (backendUp !== true && store.entries.length === 0) {
       setBoardStatus("");
     } else if (backendUp === false) {
