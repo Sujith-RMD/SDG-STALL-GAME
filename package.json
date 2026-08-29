@@ -1,8 +1,5 @@
 {
   "scripts": {
     "test": "node test/local-check.mjs"
-  },
-  "dependencies": {
-    "@vercel/analytics": "^2.0.1"
   }
 }

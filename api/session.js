@@ -58,6 +58,7 @@ module.exports = async function handler(req, res) {
 };
 
 function handleError(res, err) {
+  res.setHeader("Cache-Control", "no-store"); // never cache error responses
   if (isErrorHttp(err)) {
     res.status(err.status).json({ error: err.message });
     return;

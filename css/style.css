@@ -92,6 +92,10 @@ body {
 .meter-label { font-size: 12px; font-weight: 700; letter-spacing: .5px; }
 .bar { width: 130px; height: 10px; background: #ffffff14; border-radius: 99px; overflow: hidden; }
 .bar i { display: block; height: 100%; width: 100%; border-radius: 99px; transition: width .25s ease; }
+/* Initial meter colors (moved out of inline style attributes for CSP);
+   updateHUD() overrides them at runtime via CSSOM. */
+#bar-bee { background: #37d67a; }
+#bar-eco { background: #7ddf64; }
 .meter-val { font-size: 12.5px; font-weight: 600; min-width: 38px; text-align: right; }
 
 .counter {

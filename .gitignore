@@ -1,0 +1,10 @@
+# Dependencies
+node_modules/
+
+# Environment files — never commit real credentials
+.env
+.env.local
+.env.*.local
+
+# Vercel local project state
+.vercel

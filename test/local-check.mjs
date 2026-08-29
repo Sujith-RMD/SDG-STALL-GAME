@@ -1,5 +1,5 @@
 /*
- * Step 1 + Step 2 (rate limiting) local verification — no credentials required.
+ * Step 1 + Step 2 (rate limiting) + Step 3 (security headers) local verification — no credentials required.
  *
  * Runs the REAL api handlers end-to-end against an in-memory Redis fake
  * (injected through api/_lib/redis.js's test override), covering:
@@ -14,6 +14,8 @@
 import { createRequire } from "node:module";
 import { PassThrough } from "node:stream";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const { _setOverride, redis } = require("../api/_lib/redis.js");
@@ -475,6 +477,107 @@ setOverrideFake();
   assert.notEqual(sess.statusCode, 429, "limiter failure must NOT 429 (fail-open)");
   setOverrideFake();
   ok("Redis failure: limiter fails open, endpoints return clean 503, never crash");
+}
+
+/* ==================== Step 3: security hardening ==================== */
+setOverrideFake();
+{
+  const ROOT = fileURLToPath(new URL("..", import.meta.url));
+  const read = (p) => fs.readFileSync(new URL(`../${p}`, import.meta.url), "utf8");
+
+  // vercel.json: valid JSON + the core security headers
+  const vc = JSON.parse(read("vercel.json"));
+  const headerBlock = vc.headers?.[0];
+  assert.ok(headerBlock && headerBlock.source === "/(.*)", "headers apply to all routes");
+  const getHeader = (k) => {
+    const h = (headerBlock.headers || []).find((x) => x.key.toLowerCase() === k.toLowerCase());
+    return h && h.value;
+  };
+  const csp = getHeader("Content-Security-Policy");
+  assert.ok(csp, "CSP present");
+  assert.equal(getHeader("X-Content-Type-Options"), "nosniff");
+  assert.ok(getHeader("Referrer-Policy"), "Referrer-Policy present");
+  assert.ok(getHeader("Permissions-Policy"), "Permissions-Policy present");
+  assert.equal(getHeader("X-Frame-Options"), "DENY");
+  ok("vercel.json: valid + CSP / nosniff / Referrer-Policy / Permissions-Policy / X-Frame-Options");
+
+  // CSP permits exactly the resources this project actually uses — and nothing looser
+  for (const required of [
+    "'self'",
+    "'wasm-unsafe-eval'", // MediaPipe WASM inference (WebAssembly compilation only — NOT generic eval)
+    "https://cdn.jsdelivr.net", // MediaPipe tasks-vision module + WASM files
+    "https://fonts.googleapis.com", // Google Fonts stylesheet
+    "https://fonts.gstatic.com", // Google Fonts font files
+    "https://storage.googleapis.com", // hand_landmarker.task model download
+    "data:", // inline SVG favicon
+  ]) {
+    assert.ok(csp.includes(required), `CSP allows ${required}`);
+  }
+  assert.ok(!csp.includes("'unsafe-inline'"), "no unsafe-inline");
+  assert.ok(!csp.includes("'unsafe-eval'"), "no generic unsafe-eval");
+  ok("CSP: every real resource allowed, no unsafe-inline, no generic unsafe-eval");
+
+  // Permissions-Policy must NOT block the game's camera
+  const pp = getHeader("Permissions-Policy");
+  assert.ok(pp.includes("camera=(self)"), "camera access preserved for the game");
+  assert.ok(pp.includes("microphone=()"), "microphone denied (game uses video only)");
+  ok("Permissions-Policy: camera=(self) kept, unnecessary powerful features denied");
+
+  // index.html: no inline scripts (CSP-safe watchdog) and no inline styles
+  const html = read("index.html");
+  assert.ok(!/<script(?![^>]*\bsrc=)[^>]*>/i.test(html), "no inline <script> blocks");
+  assert.ok(html.includes("js/boot-watchdog.js"), "boot watchdog loaded as external file");
+  assert.ok(fs.existsSync(new URL("../js/boot-watchdog.js", import.meta.url)), "watchdog file exists");
+  assert.ok(!/\sstyle="/i.test(html), "no inline style attributes (bar colors moved to CSS)");
+  ok("index.html: no inline scripts/styles — CSP stays free of unsafe-inline");
+
+  // Secrets & repo hygiene
+  assert.ok(/\.env\.local/.test(read(".gitignore")), ".gitignore ignores .env.local");
+  const envExample = read(".env.example");
+  // Real Upstash REST tokens are 60+ alphanumeric chars; the placeholder
+  // values in the example are dash-separated words and must not match.
+  assert.ok(!/[A-Za-z0-9]{40,}/.test(envExample), "no real-looking token in .env.example");
+  const pkg = JSON.parse(read("package.json"));
+  assert.ok(!pkg.dependencies || !pkg.dependencies["@vercel/analytics"], "unused analytics dependency removed");
+  const frontendJs = ["js/main.js", "js/ui.js", "js/game.js", "js/vision.js", "js/ecosystem.js", "js/boot-watchdog.js"]
+    .map((f) => read(f)).join("\n");
+  assert.ok(!/UPSTASH_REDIS|KV_REST_API|REST_TOKEN/i.test(frontendJs), "no Redis credential references in frontend code");
+  ok("secrets audit: .gitignore covers .env.local, example has placeholders only, zero creds client-side");
+
+  // XSS: all rendered content (leaderboard names included) goes through textContent
+  const uiJs = read("js/ui.js");
+  const assignments = uiJs.match(/innerHTML\s*=\s*[^;]+/g) || [];
+  assert.ok(assignments.length > 0, "sanity: innerHTML usages found in ui.js");
+  for (const a of assignments) {
+    assert.ok(/innerHTML\s*=\s*""\s*$/.test(a), `innerHTML only ever cleared, never assigned content: ${a}`);
+  }
+  ok("XSS review: names/text rendered via textContent; innerHTML only ever cleared");
+
+  // API error bodies stay generic + are never cacheable
+  const leaky = /upstash|redis|token|authorization|bearer|wasm|\.js\b/i;
+  const e400 = await call(sessionHandler, mockReq({ body: { name: "" } }));
+  assert.equal(e400.statusCode, 400);
+  assert.ok(!leaky.test(JSON.stringify(e400.body)), "400 body generic");
+  const e404 = await call(scoresHandler, mockReq({
+    body: statsFor({
+      sessionId: "ffffffffffffffffffffffffffffffff", flowers: 1, cleanup: 0,
+      natives: 0, pipes: 5, closeCalls: 0, bestCombo: 0, bee: 100, eco: 50,
+    }),
+  }));
+  assert.equal(e404.statusCode, 404);
+  assert.ok(!leaky.test(JSON.stringify(e404.body)), "404 body generic");
+  assert.equal(e404.headers["cache-control"], "no-store", "error responses are no-store");
+  const r429 = mockRes();
+  await enforceRateLimit(mockReq({ headers: { "x-real-ip": "3.3.3.3" } }), r429, "test-leak", 0, 60);
+  assert.equal(r429.statusCode, 429);
+  assert.ok(!leaky.test(JSON.stringify(r429.body)), "429 body generic");
+  ok("API errors: generic bodies (400/404/429), no internal details, never cached");
+
+  // Normal flows unaffected by the header work
+  const lbOk = await call(leaderboardHandler, mockReq({ method: "GET", query: {}, headers: { "x-real-ip": "2.2.2.2" } }));
+  assert.equal(lbOk.statusCode, 200);
+  assert.match(lbOk.headers["cache-control"], /s-maxage=15/, "normal edge caching preserved");
+  ok("normal leaderboard flow + edge-cache header unchanged");
 }
 
 console.log(`\nALL ${passed} CHECKS PASSED ✅`);

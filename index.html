@@ -31,12 +31,12 @@
       <div class="hud">
         <div class="meter">
           <span class="meter-label">🐝 BEE</span>
-          <div class="bar"><i id="bar-bee" style="background:#37d67a"></i></div>
+          <div class="bar"><i id="bar-bee"></i></div>
           <span id="val-bee" class="meter-val">100%</span>
         </div>
         <div class="meter">
           <span class="meter-label">🌍 ECOSYSTEM</span>
-          <div class="bar"><i id="bar-eco" style="background:#7ddf64"></i></div>
+          <div class="bar"><i id="bar-eco"></i></div>
           <span id="val-eco" class="meter-val">0%</span>
         </div>
         <div class="counter">🌸 <strong id="val-flowers">0</strong></div>
@@ -99,14 +99,7 @@
     </aside>
   </main>
 
-  <script>
-    setTimeout(() => {
-      if (!window.__boothBooted) {
-        const el = document.getElementById("error-msg");
-        if (el) el.textContent = "Game failed to fully load — check internet (AI library downloads from CDN) and hard-refresh with Ctrl+F5.";
-      }
-    }, 7000);
-  </script>
+  <script src="js/boot-watchdog.js" defer></script>
   <script type="module" src="js/main.js"></script>
 </body>
 </html>
