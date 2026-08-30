@@ -25,7 +25,6 @@ export const els = {
   fact: $("fact-text"),
   nameStart: $("player-name-start"),
   submitNote: $("submit-note"),
-  againBtn: $("play-again"),
   retryBtn: $("retry-btn"),
   newGameBtn: $("new-game-btn"),
   overPlayer: $("over-player"),
@@ -110,7 +109,7 @@ const MEDALS = ["🥇", "🥈", "🥉"];
  * Render the Champions Board. `entries` comes either from the global API
  * (name, score, flowers, eco, rank) or from the localStorage fallback
  * ({ name, score } — extra fields render as 0).
- * `agg` = { games, flowers, avgEco }.
+ * `agg` = { players, games, flowers, avgEco }.
  */
 export function renderBoard(entries, agg) {
   const a = agg || {};

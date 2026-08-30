@@ -36,16 +36,19 @@ let backendUp = null;
 
 /* ---------- Step 4: retry identity ----------
  * playerToken: server-issued identity grouping one student's retry attempts
- * into a single personal-best leaderboard entry. Stored in sessionStorage —
- * per-tab, so closing/refreshing the tab safely defaults to "a new student"
- * (no false merges; worst case a duplicate entry, same as pre-Step-4).
- * The remembered NAME is convenience-only (prefills the start input) and is
- * never treated as identity.
+ * into a single personal-best leaderboard entry. It lives only for the
+ * current in-page flow: every page load (fresh or refresh) wipes any stale
+ * token, because sessionStorage would otherwise survive an organizer's F5
+ * and silently merge the NEXT student into the previous player's entry.
+ * RETRY is in-page and unaffected; NEW GAME still wipes it explicitly.
+ * The remembered NAME is convenience-only (prefills the start input), is
+ * never treated as identity, and survives refreshes by design.
  */
 const TOKEN_KEY = "pp_player_token";
 const NAME_KEY = "pp_player_name";
+// A page load — fresh or refresh — never inherits a player identity.
+try { sessionStorage.removeItem(TOKEN_KEY); } catch {}
 let playerToken = null;
-try { playerToken = sessionStorage.getItem(TOKEN_KEY) || null; } catch {}
 try {
   const savedName = localStorage.getItem(NAME_KEY);
   if (savedName) {

@@ -494,6 +494,18 @@ setOverrideFake();
   ok("oversized requests still rejected with 413 (4 KB limit intact)");
 }
 
+/* ---------------- 15b. pre-parsed body 4 KB cap (Step 6 / A5) ------------- */
+{
+  // Vercel pre-parses JSON into req.body — that path previously BYPASSED the
+  // 4 KB cap (it was only enforced on streamed/string bodies).
+  const oversized = await call(sessionHandler, mockReq({ body: { pad: "x".repeat(5000) } }));
+  assert.equal(oversized.statusCode, 413, "pre-parsed object over 4 KB -> 413");
+  assert.equal(oversized.body.error, "Request body too large");
+  const fine = await call(sessionHandler, mockReq({ body: { name: "PreParsed" } }));
+  assert.equal(fine.statusCode, 200, "pre-parsed object under the cap still accepted");
+  ok("pre-parsed req.body enforces the 4 KB cap without breaking valid bodies");
+}
+
 /* ---------------- 16. Redis down: limiter fails open, APIs stay clean ----- */
 {
   _setOverride(null);
@@ -700,6 +712,37 @@ setOverrideFake();
   const [zl] = await redis([["ZSCORE", "lb:all", sL.body.sessionId]]);
   assert.equal(Number(zl), rL.body.score, "legacy member = sessionId");
   ok("legacy clients (no playerToken): sessionId member, behavior unchanged");
+}
+
+/* ==================== Step 6: audit fixes (A3 / A1) ==================== */
+{
+  const read = (p) => fs.readFileSync(new URL(`../${p}`, import.meta.url), "utf8");
+
+  // A3: a page load (fresh or refresh) must never RESTORE a playerToken —
+  // sessionStorage survives F5, and restoring it at boot is exactly what let
+  // a new student's attempts merge into the previous player's identity after
+  // an organizer refresh. RETRY is in-page and unaffected by the boot wipe.
+  const mainJs = read("js/main.js");
+  assert.ok(
+    !/sessionStorage\.getItem\(TOKEN_KEY\)/.test(mainJs),
+    "main.js must not restore playerToken from sessionStorage at boot"
+  );
+  assert.ok(
+    /sessionStorage\.removeItem\(TOKEN_KEY\)/.test(mainJs),
+    "main.js must wipe any stale playerToken at page boot"
+  );
+  ok("identity lifecycle: page boot never restores a stale playerToken (A3)");
+
+  // A1: every element id referenced from ui.js must exist in index.html —
+  // the removed againBtn: $("play-again") silently resolved to null after
+  // Step 4 renamed the button. This guard fails on any future rename drift.
+  const uiJs = read("js/ui.js");
+  const html = read("index.html");
+  const ids = [...uiJs.matchAll(/\$\("([^"]+)"\)/g)].map((m) => m[1]);
+  assert.ok(ids.length >= 35, "sanity: ui.js element references found");
+  const missing = ids.filter((id) => !html.includes(`id="${id}"`));
+  assert.deepEqual(missing, [], `ui.js references missing elements: ${missing.join(", ")}`);
+  ok("ui.js element ids all exist in index.html (no orphaned DOM references) (A1)");
 }
 
 console.log(`\nALL ${passed} CHECKS PASSED ✅`);

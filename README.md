@@ -33,7 +33,7 @@ The **ecosystem meter** is the real score: high eco heals the land and adds a la
 - 🔐 **Server-authoritative scoring** — the client never sends a score; the server recomputes it from raw stats and rejects impossible ones
 - 🛡️ **Hardened** — strict CSP (no `unsafe-inline`/`unsafe-eval`), permission policy, per-IP rate limiting, global daily circuit breaker
 - ♻️ **Zero runtime dependencies** — vanilla ES-module frontend, dependency-free Node serverless functions, hand-written Redis REST client
-- ✅ **43-check self-testing suite** — runs the real API handlers end-to-end against an in-memory Redis fake, no credentials needed
+- ✅ **55-check self-testing suite** — runs the real API handlers end-to-end against an in-memory Redis fake, no credentials needed
 
 ---
 
@@ -51,7 +51,7 @@ The **ecosystem meter** is the real score: high eco heals the land and adds a la
 | Database | **Upstash Redis** (REST API — ideal for serverless: HTTP, no TCP) |
 | Hosting / CDN | **Vercel** (static + functions, edge caching) |
 | Security | `vercel.json` headers: CSP, Permissions-Policy, HSTS, X-Frame-Options, nosniff, Referrer-Policy, COOP |
-| Testing | Custom zero-dependency Node test harness (43 checks) |
+| Testing | Custom zero-dependency Node test harness (55 checks) |
 | Analytics | Vercel Web Analytics (platform-injected script) |
 
 ### Architecture
@@ -132,12 +132,14 @@ All endpoints are **same-origin only** (no CORS by design), accept/receive JSON,
 
 ```jsonc
 // request
-{ "name": "Bee Hero" }            // 1–14 chars, control chars stripped
+{ "name": "Bee Hero", "playerToken": "e3a7…" }   // 1–14 chars, control chars stripped;
+                                                 // playerToken is OPTIONAL — present on
+                                                 // RETRY, omitted on NEW GAME / first visit
 
 // 200
-{ "sessionId": "9f1c…" }          // 32-hex crypto-random, 15-min TTL
+{ "sessionId": "9f1c…", "playerToken": "e3a7…" } // 32-hex crypto-random, 15-min TTL
 
-// errors: 400 invalid name · 405 wrong method · 429 rate-limited · 503 backend down
+// errors: 400 invalid name/token · 405 wrong method · 429 rate-limited · 503 backend down
 ```
 
 ### `POST /api/scores`
@@ -149,11 +151,13 @@ All endpoints are **same-origin only** (no CORS by design), accept/receive JSON,
   "durationMs": 87234,
   "flowers": 23, "cleanup": 4, "natives": 2,
   "pipes": 41, "closeCalls": 6, "bestCombo": 9,
-  "bee": 72, "eco": 63
+  "bee": 72, "eco": 63,
+  "playerToken": "e3a7…"           // optional — present on RETRY; legacy clients omit it
 }
 
 // 200 — the server computes the authoritative score
-{ "score": 512, "rank": 3 }
+{ "score": 512, "rank": 3, "best": 512, "newBest": true }
+// best/newBest = the player's personal best after this attempt (RETRY support)
 
 // errors: 400 invalid/impossible stats · 404 session expired · 409 already submitted · 413 body > 4 KB
 ```
@@ -165,9 +169,20 @@ All endpoints are **same-origin only** (no CORS by design), accept/receive JSON,
 {
   "period": "all",
   "entries": [ { "rank": 1, "name": "Bee Hero", "score": 512, "flowers": 23, "eco": 63 } ],  // top 10
-  "aggregates": { "games": 128, "flowers": 1042, "avgEco": 58 }
+  "aggregates": { "players": 12, "games": 128, "flowers": 1042, "avgEco": 58 }
+  // players = unique players (one entry per token); games = finished runs, retries included
 }
 ```
+
+---
+
+## 🔁 Retry & New Game (personal best)
+
+- **🔁 RETRY — same player, new session.** Every attempt gets a fresh 15-minute session (one-submission-per-session intact) filed under the same server-issued `playerToken`.
+- **👤 NEW GAME — new identity.** Clears the client token so the next student mints their own — no accounts, no login.
+- **Personal best:** a player's board entry always holds their **highest** score (atomic `ZADD GT`) — a lower retry never replaces it, and the stored run details always describe the best run.
+- **Same display name ≠ same player.** Identity is the token, never the typed name — two students both named "Alex" stay separate entries.
+- **A page refresh always starts a fresh identity.** `sessionStorage` survives F5, so the token is wiped at page boot instead of risking a merge into the previous player's entry.
 
 ---
 
@@ -217,7 +232,7 @@ Limits are deliberately generous: a stall full of students shares one public IP.
 npm test
 ```
 
-**43 checks, zero credentials required.** The suite runs the *real* API handlers end-to-end against an in-memory Redis fake injected through the Redis client's test override, covering: session minting & name validation · server-side scoring & impossible-stat rejection · one-submission-per-session · ranking/aggregates/top-10 · rate limiting (limits, `Retry-After`, multi-IP independence, global cap, concurrent-request atomicity) · Redis-outage behavior · security headers/CSP · secrets audit · XSS-safe rendering · error bodies stay generic.
+**55 checks, zero credentials required.** The suite runs the *real* API handlers end-to-end against an in-memory Redis fake injected through the Redis client's test override, covering: session minting & name validation · server-side scoring & impossible-stat rejection · one-submission-per-session · ranking/aggregates/top-10 · rate limiting (limits, `Retry-After`, multi-IP independence, global cap, concurrent-request atomicity) · Redis-outage behavior · security headers/CSP · secrets audit · XSS-safe rendering · error bodies stay generic.
 
 ---
 
@@ -244,7 +259,7 @@ pollinator-panic/
 │       ├── http.js         # body parsing (4 KB cap), error helpers
 │       ├── score.js        # scoring formula + caps
 │       └── validate.js     # stat re-validation
-├── test/local-check.mjs    # 43-check suite (in-memory Redis fake)
+├── test/local-check.mjs    # 55-check suite (in-memory Redis fake)
 ├── vercel.json             # security headers
 ├── .env.example            # variable names only — no secrets
 └── package.json            # zero dependencies

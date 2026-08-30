@@ -22,7 +22,21 @@ async function readJsonBody(req) {
   if (req.body !== undefined && req.body !== null) {
     const b = req.body;
     if (typeof b === "object" && !Buffer.isBuffer(b)) {
-      return b; // already parsed by the platform
+      /*
+       * Pre-parsed by the platform (Vercel). The 4 KB cap must hold here
+       * too: re-serialize and measure, otherwise a large pre-parsed body
+       * would bypass the limit that streamed bodies are subject to.
+       */
+      let serialized;
+      try {
+        serialized = JSON.stringify(b);
+      } catch {
+        throw httpError(400, "Malformed JSON body");
+      }
+      if (Buffer.byteLength(serialized, "utf8") > MAX_BODY_BYTES) {
+        throw httpError(413, "Request body too large");
+      }
+      return b;
     }
     return parseJson(Buffer.isBuffer(b) ? b.toString("utf8") : String(b));
   }
