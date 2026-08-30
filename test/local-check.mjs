@@ -99,6 +99,10 @@ function setOverrideFake() {
           const v = e.z.get(String(cmd[2]));
           return v === undefined ? null : v;
         }
+        case "ZCARD": {
+          const e = store.get(cmd[1]);
+          return e ? e.z.size : 0;
+        }
         case "ZREVRANK": {
           const [, k, member] = cmd;
           const e = store.get(k);
@@ -323,6 +327,7 @@ for (const [label, over] of [
   assert.equal(res.body.entries[1].name, "Alpha");
   assert.equal(res.body.entries[0].rank, 1);
   assert.equal(res.body.aggregates.games, 2);
+  assert.equal(res.body.aggregates.players, 2); // distinct members on lb:all (unique players)
   assert.equal(res.body.aggregates.flowers, 3 + 5);
   assert.equal(res.body.aggregates.avgEco, Math.round((45 + 60) / 2));
   assert.match(res.headers["cache-control"], /s-maxage=15/);

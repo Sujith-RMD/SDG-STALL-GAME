@@ -3,7 +3,7 @@
  * -> 200 {
  *      period,
  *      entries: [{ rank, name, score, flowers, eco }],
- *      aggregates: { games, flowers, avgEco }
+ *      aggregates: { players, games, flowers, avgEco }
  *    }
  *
  * Ranked with a Redis sorted set (highest first). The response carries a
@@ -30,11 +30,16 @@ module.exports = async function handler(req, res) {
     const period = req.query?.period === "today" ? "today" : "all";
     const key = period === "today" ? `lb:day:${todayKey()}` : "lb:all";
 
-    const [top, gamesRaw, flowersRaw, ecoSumRaw] = await redis([
+    const [top, gamesRaw, flowersRaw, ecoSumRaw, playersRaw] = await redis([
       ["ZREVRANGE", key, 0, 9, "WITHSCORES"],
       ["GET", "stats:games"],
       ["GET", "stats:flowers"],
       ["GET", "stats:ecosum"],
+      // Unique players = distinct members on the all-time board (playerToken,
+      // or legacy sessionId for pre-token entries). RETRY runs keep one
+      // member per player, so this stays a true headcount while stats:games
+      // counts every finished run.
+      ["ZCARD", "lb:all"],
     ]);
 
     const ids = [];
@@ -64,6 +69,7 @@ module.exports = async function handler(req, res) {
     const flowersTotal = Number(flowersRaw ?? 0);
     const ecoSum = Number(ecoSumRaw ?? 0);
     const aggregates = {
+      players: Number(playersRaw ?? 0),
       games,
       flowers: flowersTotal,
       avgEco: games > 0 ? Math.round(ecoSum / games) : 0,

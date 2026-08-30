@@ -31,6 +31,7 @@ export const els = {
   overPlayer: $("over-player"),
   bestNote: $("best-note"),
   board: $("leaderboard"),
+  aggPlayers: $("agg-players"),
   aggGames: $("agg-games"),
   aggFlowers: $("agg-flowers"),
   aggEco: $("agg-eco"),
@@ -133,7 +134,8 @@ export function renderBoard(entries, agg) {
       els.board.appendChild(li);
     });
   }
-  els.aggGames.textContent = a.games ?? 0;
+  els.aggPlayers.textContent = a.players ?? 0; // unique players (one entry per playerToken)
+  els.aggGames.textContent = a.games ?? 0; // finished runs (retries included)
   els.aggFlowers.textContent = a.flowers ?? 0;
   els.aggEco.textContent = `${a.avgEco ?? 0}%`;
 }

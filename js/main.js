@@ -258,6 +258,10 @@ function endGame() {
 
   // Auto-submit: no save button. Global when available, local otherwise.
   if (sessionId) {
+    // The server is the score authority (its ranked score excludes the live
+    // combo multiplier), so show a placeholder instead of the combo-inflated
+    // client estimate until the official score arrives.
+    els.score.textContent = "…";
     els.submitNote.textContent = "🌍 Submitting to the global board…";
     submitScore(pendingReport);
   } else {
@@ -306,7 +310,14 @@ function newGame() {
 
 function localAgg() {
   const t = store.totals;
-  return { games: t.games, flowers: t.flowers, avgEco: t.games ? Math.round(t.sumEco / t.games) : 0 };
+  return {
+    games: t.games,
+    flowers: t.flowers,
+    avgEco: t.games ? Math.round(t.sumEco / t.games) : 0,
+    // Offline there is no server identity — the closest honest "players"
+    // count is distinct names on this device's local board.
+    players: new Set(store.entries.map((e) => e.name)).size,
+  };
 }
 
 async function apiFetch(path, options = {}) {
@@ -394,6 +405,7 @@ async function submitScore(report) {
     }
     if (r.status === 409) {
       els.submitNote.textContent = "🌍 This run was already submitted.";
+      els.score.textContent = report.score; // nothing better exists for this run — show the local estimate
       return;
     }
     throw new Error(`score submit failed (${r.status})`);
@@ -410,6 +422,7 @@ function saveLocalFallback(report) {
     .reduce((m, e) => Math.max(m, e.score), 0) || null;
   const newBest = prevBest == null || report.score > prevBest;
   setBestNote(newBest ? report.score : prevBest, newBest);
+  els.score.textContent = report.score; // offline: the local score is the only score
   store.entries.push({ name: playerName || "Anonymous Bee", score: report.score });
   store.entries.sort((a, b) => b.score - a.score);
   store.entries = store.entries.slice(0, 50);
