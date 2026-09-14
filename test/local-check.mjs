@@ -19,11 +19,13 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const { _setOverride, redis } = require("../api/_lib/redis.js");
-const { computeScore } = require("../api/_lib/score.js");
+const { computeScore, todayKey: dayKeyOf } = require("../api/_lib/score.js");
 const { enforceRateLimit } = require("../api/_lib/ratelimit.js");
+const { TRIM_SCRIPT } = require("../api/_lib/trim.js");
 const sessionHandler = require("../api/session.js");
 const scoresHandler = require("../api/scores.js");
 const leaderboardHandler = require("../api/leaderboard.js");
+const adminTrimHandler = require("../api/admin/trim-leaderboard.js");
 
 let passed = 0;
 function ok(label) {
@@ -33,6 +35,14 @@ function ok(label) {
 
 /* ---------------- in-memory Redis fake (Upstash-compatible shapes) ----- */
 const store = new Map();
+
+/*
+ * Fault injection for the admin trim route: when non-zero, the fake's EVAL
+ * misreports the post-trim count. Used to prove the handler's independent
+ * read-back rejects an inconsistent result instead of returning 200.
+ */
+let evalCountFault = 0;
+
 function purge(k) {
   const e = store.get(k);
   if (e && e.exp && e.exp <= Date.now()) store.delete(k);
@@ -41,6 +51,162 @@ function entry(k) {
   purge(k);
   if (!store.has(k)) store.set(k, { z: new Map(), h: new Map(), v: null, exp: null });
   return store.get(k);
+}
+
+/* ---------------- sorted-set helpers (fake + the EVAL model share these) ---
+ * Redis orders a sorted set by score ASCENDING, ties broken by member
+ * lexicographically ASCENDING. ZREVRANGE reverses that whole order, so equal
+ * scores come back with members in DESCENDING lexicographic order. */
+function zItems(key, dir = "asc") {
+  const e = store.get(key);
+  if (!e) return [];
+  const items = [...e.z.entries()].sort(
+    (a, b) => a[1] - b[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)
+  );
+  return dir === "rev" ? items.reverse() : items;
+}
+
+/** Parse a Redis score bound: a number, "-inf", "+inf", or "(n" for exclusive. */
+function parseBound(text) {
+  const s = String(text);
+  if (s === "-inf") return { value: -Infinity, exclusive: false };
+  if (s === "+inf" || s === "inf") return { value: Infinity, exclusive: false };
+  if (s.startsWith("(")) return { value: Number(s.slice(1)), exclusive: true };
+  return { value: Number(s), exclusive: false };
+}
+
+function scoreInRange(score, minText, maxText) {
+  const lo = parseBound(minText);
+  const hi = parseBound(maxText);
+  const atLeast = lo.exclusive ? score > lo.value : score >= lo.value;
+  const atMost = hi.exclusive ? score < hi.value : score <= hi.value;
+  return atLeast && atMost;
+}
+
+/** Inclusive index range with Redis's negative-index semantics. */
+function sliceRange(items, start, stop) {
+  const n = items.length;
+  let s = Number(start);
+  let e = Number(stop);
+  if (s < 0) s = Math.max(0, n + s);
+  if (e < 0) e = n + e;
+  if (s >= n || e < s) return [];
+  return items.slice(s, e + 1);
+}
+
+/** WITHSCORES flattening, matching the REST client's unwrapped result shape. */
+function flatten(items, withScores) {
+  if (!withScores) return items.map(([m]) => m);
+  const out = [];
+  for (const [m, s] of items) {
+    out.push(m);
+    out.push(String(s));
+  }
+  return out;
+}
+
+/*
+ * JS model of TRIM_SCRIPT (api/_lib/trim.js), used by the fake's EVAL.
+ *
+ * The fake Redis cannot execute Lua, so this mirrors the script operation for
+ * operation so the admin route can be exercised end to end. It is a MODEL, not
+ * the script itself — the structural checks in Step 7 assert that the real
+ * script still performs every safety step, and the handler independently reads
+ * the board back after the call, so a model/script divergence cannot quietly
+ * produce a false "success".
+ */
+function trimScriptModel(key, prefix, keepArg, applyArg) {
+  const keep = Number(keepArg);
+  const apply = applyArg === "1";
+  const MAX_BOUNDARY = 500;
+
+  const report = (status, detail, before, after, expected, cutoff, removed, tiebreak) =>
+    [status, detail, before, after, expected, cutoff, removed, tiebreak];
+
+  const zcard = () => (store.get(key) ? store.get(key).z.size : 0);
+
+  const before = zcard();
+  if (before === 0) return report("empty", "", 0, 0, 0, 0, 0, "none");
+
+  const expected = Math.min(keep, before);
+  if (before <= expected) return report("noop", "", before, before, expected, 0, 0, "none");
+
+  const edge = zItems(key, "rev")[expected - 1];
+  if (!edge) {
+    return report("preflight_failed", `no entry found at rank ${expected}`, before, before, expected, 0, 0, "none");
+  }
+  const cutoff = edge[1];
+
+  const above = zItems(key, "asc").filter(([, s]) => s > cutoff).length;
+  if (above > expected) {
+    return report(
+      "preflight_failed",
+      `${above} entries outrank the cutoff but only ${expected} are kept`,
+      before, before, expected, cutoff, 0, "none"
+    );
+  }
+
+  const needFromBoundary = expected - above;
+  const boundary = zItems(key, "asc").filter(([, s]) => s === cutoff).map(([m]) => m);
+
+  let tiebreak = "timestamp";
+  const doomed = [];
+
+  if (boundary.length > MAX_BOUNDARY) {
+    tiebreak = "rank";
+  } else {
+    const ordered = boundary.map((member) => {
+      const hash = store.get(`${prefix}${member}`);
+      const raw = hash ? hash.h.get("ts") : undefined;
+      return [member, raw === undefined || raw === null ? null : Number(raw)];
+    });
+    // ts ascending, entries with no recorded ts last, then member ascending.
+    ordered.sort((a, b) => {
+      if (a[1] !== b[1]) {
+        if (a[1] === null) return 1;
+        if (b[1] === null) return -1;
+        return a[1] - b[1];
+      }
+      return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
+    });
+    for (let i = needFromBoundary; i < ordered.length; i++) doomed.push(ordered[i][0]);
+  }
+
+  if (!apply) return report("dry_run", "", before, expected, expected, cutoff, 0, tiebreak);
+
+  // 1) everything strictly below the cutoff
+  const entrySet = store.get(key).z;
+  for (const [m, s] of [...entrySet.entries()]) {
+    if (s < cutoff) entrySet.delete(m);
+  }
+
+  // 2) the boundary losers — by rank (lowest first) or by explicit member
+  if (tiebreak === "rank") {
+    const drop = boundary.length - needFromBoundary;
+    if (drop > 0) {
+      for (const [m] of zItems(key, "asc").slice(0, drop)) entrySet.delete(m);
+    }
+  } else {
+    for (const m of doomed) entrySet.delete(m);
+  }
+
+  const after = zcard();
+  if (after !== expected) {
+    return report(
+      "verify_failed",
+      `expected ${expected} entries after the trim, found ${after}`,
+      before, after, expected, cutoff, before - after, tiebreak
+    );
+  }
+  const lowest = zItems(key, "asc")[0];
+  if (lowest && lowest[1] < cutoff) {
+    return report(
+      "verify_failed",
+      `a surviving entry scores below the cutoff (${lowest[1]} < ${cutoff})`,
+      before, after, expected, cutoff, before - after, tiebreak
+    );
+  }
+  return report("ok", "", before, after, expected, cutoff, before - after, tiebreak);
 }
 
 function setOverrideFake() {
@@ -81,16 +247,69 @@ function setOverrideFake() {
           return existing === undefined ? 1 : 0;
         }
         case "ZREVRANGE": {
+          const [, k, start, stop, ...flags] = cmd;
+          return flatten(sliceRange(zItems(k, "rev"), start, stop), flags.includes("WITHSCORES"));
+        }
+        case "ZRANGE": {
+          const [, k, start, stop, ...flags] = cmd;
+          return flatten(sliceRange(zItems(k, "asc"), start, stop), flags.includes("WITHSCORES"));
+        }
+        case "ZRANGEBYSCORE": {
+          const [, k, min, max, ...flags] = cmd;
+          const inRange = zItems(k, "asc").filter(([, s]) => scoreInRange(s, min, max));
+          return flatten(inRange, flags.includes("WITHSCORES"));
+        }
+        case "ZCOUNT": {
+          const [, k, min, max] = cmd;
+          return zItems(k, "asc").filter(([, s]) => scoreInRange(s, min, max)).length;
+        }
+        case "ZREMRANGEBYSCORE": {
+          const [, k, min, max] = cmd;
+          const e = store.get(k);
+          if (!e) return 0;
+          let removed = 0;
+          for (const [m, s] of [...e.z.entries()]) {
+            if (scoreInRange(s, min, max)) {
+              e.z.delete(m);
+              removed += 1;
+            }
+          }
+          return removed;
+        }
+        case "ZREMRANGEBYRANK": {
+          // Ranks ASCEND by score: rank 0 is the LOWEST entry.
           const [, k, start, stop] = cmd;
           const e = store.get(k);
-          if (!e) return [];
-          const items = [...e.z.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
-          const slice = items.slice(Number(start), Number(stop) + 1);
-          const out = [];
-          for (const [m, s] of slice) {
-            out.push(m);
-            out.push(String(s));
+          if (!e) return 0;
+          const doomed = sliceRange(zItems(k, "asc"), start, stop).map(([m]) => m);
+          for (const m of doomed) e.z.delete(m);
+          return doomed.length;
+        }
+        case "ZREM": {
+          const [, k, ...members] = cmd;
+          const e = store.get(k);
+          if (!e) return 0;
+          let removed = 0;
+          for (const m of members) {
+            if (e.z.delete(String(m))) removed += 1;
           }
+          return removed;
+        }
+        case "DEL": {
+          const [, ...keys] = cmd;
+          let removed = 0;
+          for (const k of keys) {
+            if (store.delete(k)) removed += 1;
+          }
+          return removed;
+        }
+        case "EVAL": {
+          const [, script, numKeys, ...rest] = cmd;
+          if (script !== TRIM_SCRIPT) throw new Error("fake redis: unrecognised script");
+          const n = Number(numKeys);
+          // KEYS[1] = rest[0]; ARGV[1..] = rest[n..]
+          const out = trimScriptModel(rest[0], rest[n], rest[n + 1], rest[n + 2]);
+          if (evalCountFault) out[3] = Number(out[3]) + evalCountFault; // index 3 = `after`
           return out;
         }
         case "ZSCORE": {
@@ -743,6 +962,358 @@ setOverrideFake();
   const missing = ids.filter((id) => !html.includes(`id="${id}"`));
   assert.deepEqual(missing, [], `ui.js references missing elements: ${missing.join(", ")}`);
   ok("ui.js element ids all exist in index.html (no orphaned DOM references) (A1)");
+}
+
+/* ==================== Step 7: admin leaderboard trim ==================== */
+/*
+ * Covers POST /api/admin/trim-leaderboard — the Redis counterpart of
+ * sql/trim-leaderboard.sql.
+ *
+ * The fake Redis cannot execute Lua, so its EVAL delegates to trimScriptModel
+ * above. Everything else is the real production path: auth, validation, the
+ * dry-run default, the report, and the handler's own read-back verification.
+ * The structural checks at the end of this block assert that the real Lua
+ * script still performs each safety step, so a model/script divergence cannot
+ * pass silently.
+ */
+setOverrideFake();
+{
+  const ADMIN = "test-admin-secret-0123456789abcdef"; // 34 chars, over the 24 minimum
+  const DAY_KEY = `lb:day:${dayKeyOf()}`;
+  process.env.ADMIN_TRIM_TOKEN = ADMIN;
+  process.env.RATE_LIMIT_ADMIN_TRIM_PER_MIN = "500"; // keep this suite out of the limiter's way
+
+  const adminReq = (body, headers = {}) =>
+    mockReq({ body, headers: { "x-real-ip": "10.0.0.1", authorization: `Bearer ${ADMIN}`, ...headers } });
+
+  const boardSize = (k) => (store.get(k) ? store.get(k).z.size : 0);
+  const boardMembers = () => [...(store.get("lb:all")?.z.keys() ?? [])];
+  const topMembers = () => zItems("lb:all", "rev").map(([m]) => m);
+
+  async function seedBoard() {
+    // A 500 · B 400 · C 300 (ts 3000) · D 300 (ts 4000) · E 200 · F 100
+    // The 3rd place is a tie, so the ts tiebreak decides between C and D.
+    await redis([
+      ["ZADD", "lb:all", "500", "A"], ["HSET", "score:detail:A", "name", "Ana", "ts", "1000"],
+      ["ZADD", "lb:all", "400", "B"], ["HSET", "score:detail:B", "name", "Ben", "ts", "2000"],
+      ["ZADD", "lb:all", "300", "C"], ["HSET", "score:detail:C", "name", "Cara", "ts", "3000"],
+      ["ZADD", "lb:all", "300", "D"], ["HSET", "score:detail:D", "name", "Dev", "ts", "4000"],
+      ["ZADD", "lb:all", "200", "E"], ["HSET", "score:detail:E", "name", "Eve", "ts", "5000"],
+      ["ZADD", "lb:all", "100", "F"], ["HSET", "score:detail:F", "name", "Fay", "ts", "6000"],
+    ]);
+  }
+
+  /* ---------------- 17. auth: fail closed, constant-time, two headers ------ */
+  {
+    const saved = process.env.ADMIN_TRIM_TOKEN;
+
+    delete process.env.ADMIN_TRIM_TOKEN;
+    const missing = await call(adminTrimHandler, adminReq({}));
+    assert.equal(missing.statusCode, 503, "an unconfigured admin route must refuse to run");
+    assert.equal(missing.body.error, "Admin trim endpoint is not configured");
+
+    process.env.ADMIN_TRIM_TOKEN = "tooshort";
+    const weak = await call(adminTrimHandler, adminReq({}));
+    assert.equal(weak.statusCode, 503, "a guessable secret counts as unconfigured");
+
+    process.env.ADMIN_TRIM_TOKEN = saved;
+    ok("admin auth: missing or too-short secret -> 503 (fails closed, never open)");
+  }
+  {
+    const none = await call(adminTrimHandler, mockReq({ body: {}, headers: { "x-real-ip": "10.0.0.2" } }));
+    assert.equal(none.statusCode, 401);
+
+    const wrong = await call(adminTrimHandler, adminReq({}, { authorization: `Bearer ${"z".repeat(34)}` }));
+    assert.equal(wrong.statusCode, 401);
+
+    const wrongLength = await call(adminTrimHandler, adminReq({}, { authorization: "Bearer x" }));
+    assert.equal(wrongLength.statusCode, 401, "a different-length secret -> 401, not a crash");
+
+    const viaHeader = await call(adminTrimHandler,
+      mockReq({ body: {}, headers: { "x-real-ip": "10.0.0.2", "x-admin-token": ADMIN } }));
+    assert.equal(viaHeader.statusCode, 200, "X-Admin-Token is accepted");
+
+    ok("admin auth: absent/wrong/wrong-length secret -> 401; X-Admin-Token accepted");
+  }
+
+  /* ---------------- 18. dry run is the default ---------------------------- */
+  {
+    clearFakeStore();
+    await seedBoard();
+
+    const res = await call(adminTrimHandler, adminReq({}));
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.applied, false, "a bodyless request must NOT delete anything");
+    assert.equal(res.body.dryRun, true);
+    assert.equal(res.body.keep, 3);
+
+    const board = res.body.boards[0];
+    assert.equal(board.key, "lb:all");
+    assert.equal(board.status, "dry_run");
+    assert.equal(board.before, 6);
+    assert.equal(board.wouldRemove, 3);
+    assert.equal(board.after, 3, "`after` is the projected count on a dry run");
+    assert.equal(board.removed, 0, "a dry run removes nothing");
+    assert.equal(board.cutoff, 300);
+    assert.equal(board.tiebreak, "timestamp");
+    assert.equal(boardSize("lb:all"), 6, "the board is untouched");
+
+    ok("dry run is the default: reports the plan, deletes nothing");
+  }
+
+  /* ---------------- 19. confirm:true applies, and only the top 3 remain ---- */
+  {
+    const res = await call(adminTrimHandler, adminReq({ confirm: true }));
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.applied, true);
+    assert.equal(res.body.dryRun, false);
+
+    const board = res.body.boards[0];
+    assert.equal(board.status, "ok");
+    assert.equal(board.before, 6);
+    assert.equal(board.after, 3);
+    assert.equal(board.removed, 3);
+    assert.equal(board.expected, 3);
+    assert.equal(board.countVerified, true, "the handler's read-back agrees with the script");
+
+    assert.deepEqual(board.kept.map((e) => e.member), ["A", "B", "C"]);
+    assert.deepEqual(board.kept.map((e) => e.score), [500, 400, 300]);
+    assert.equal(board.kept[0].rank, 1);
+    assert.equal(board.kept[0].name, "Ana");
+
+    assert.equal(boardSize("lb:all"), 3, "exactly 3 entries remain");
+    assert.deepEqual(topMembers(), ["A", "B", "C"]);
+    assert.ok(!boardMembers().includes("D"), "D lost the 3rd-place tie on ts");
+    assert.ok(!boardMembers().includes("E"));
+    assert.ok(!boardMembers().includes("F"));
+
+    assert.ok(
+      res.body.warnings.some((w) => /aggregates\.players/.test(w)),
+      "the aggregates.players side effect is reported"
+    );
+
+    ok("apply: exactly the 3 highest-scoring entries remain; boundary tie resolved by ts");
+  }
+
+  /* ---------------- 20. idempotency -------------------------------------- */
+  {
+    const before = boardSize("lb:all");
+    const res = await call(adminTrimHandler, adminReq({ confirm: true }));
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.boards[0].status, "noop", "a second run has nothing to trim");
+    assert.equal(res.body.boards[0].removed, 0);
+    assert.equal(boardSize("lb:all"), before);
+    ok("idempotent: a second apply removes nothing");
+  }
+
+  /* ---------------- 21. tie against an entry with no recorded ts ---------- */
+  {
+    clearFakeStore();
+    await redis([
+      ["ZADD", "lb:all", "500", "A"], ["HSET", "score:detail:A", "name", "Ana", "ts", "1000"],
+      ["ZADD", "lb:all", "400", "B"], ["HSET", "score:detail:B", "name", "Ben", "ts", "2000"],
+      ["ZADD", "lb:all", "300", "C"], ["HSET", "score:detail:C", "name", "Cara", "ts", "3000"],
+      ["ZADD", "lb:all", "300", "LEGACY"], // no detail hash at all -> no ts
+      ["ZADD", "lb:all", "100", "Z"],
+    ]);
+    const res = await call(adminTrimHandler, adminReq({ confirm: true }));
+    assert.equal(res.statusCode, 200);
+    assert.equal(boardSize("lb:all"), 3);
+    assert.deepEqual(topMembers(), ["A", "B", "C"]);
+    assert.ok(!boardMembers().includes("LEGACY"), "no recorded ts loses the tie to a known one");
+    ok("boundary tie: an entry with no recorded ts loses to one with provenance");
+  }
+
+  /* ---------------- 22. small and empty boards --------------------------- */
+  {
+    clearFakeStore();
+    await redis([
+      ["ZADD", "lb:all", "10", "only"], ["HSET", "score:detail:only", "name", "Solo", "ts", "1"],
+    ]);
+    const small = await call(adminTrimHandler, adminReq({ confirm: true }));
+    assert.equal(small.statusCode, 200);
+    assert.equal(small.body.boards[0].status, "noop");
+    assert.equal(boardSize("lb:all"), 1, "a board smaller than `keep` is left alone");
+
+    clearFakeStore();
+    const empty = await call(adminTrimHandler, adminReq({ confirm: true }));
+    assert.equal(empty.statusCode, 200);
+    assert.equal(empty.body.boards[0].status, "empty");
+    assert.equal(empty.body.boards[0].before, 0);
+    ok("small/empty board: no error, nothing removed");
+  }
+
+  /* ---------------- 23. keep override and explicit dryRun:true ----------- */
+  {
+    clearFakeStore();
+    await seedBoard();
+
+    const preview = await call(adminTrimHandler, adminReq({ confirm: true, dryRun: true }));
+    assert.equal(preview.body.applied, false, "explicit dryRun:true beats confirm:true");
+    assert.equal(boardSize("lb:all"), 6, "the preview deleted nothing");
+
+    const res = await call(adminTrimHandler, adminReq({ confirm: true, keep: 2 }));
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.keep, 2);
+    assert.equal(boardSize("lb:all"), 2);
+    assert.deepEqual(topMembers(), ["A", "B"]);
+    ok("keep override trims to 2; explicit dryRun:true suppresses the delete");
+  }
+
+  /* ---------------- 24. scope: today vs both ----------------------------- */
+  {
+    clearFakeStore();
+    await seedBoard();
+    await redis([
+      ["ZADD", DAY_KEY, "900", "X"], ["ZADD", DAY_KEY, "800", "Y"],
+      ["ZADD", DAY_KEY, "700", "Z"], ["ZADD", DAY_KEY, "100", "W"],
+    ]);
+
+    const today = await call(adminTrimHandler, adminReq({ confirm: true, scope: "today" }));
+    assert.equal(today.statusCode, 200);
+    assert.equal(today.body.boards.length, 1);
+    assert.equal(today.body.boards[0].key, DAY_KEY);
+    assert.equal(boardSize(DAY_KEY), 3, "the daily board is trimmed");
+    assert.equal(boardSize("lb:all"), 6, "scope=today leaves the all-time board alone");
+
+    const both = await call(adminTrimHandler, adminReq({ confirm: true, scope: "both" }));
+    assert.equal(both.body.boards.length, 2);
+    assert.equal(boardSize("lb:all"), 3);
+    assert.equal(boardSize(DAY_KEY), 3);
+    ok("scope: `today` trims only the daily board; `both` trims each board");
+  }
+
+  /* ---------------- 25. stats counters are not rewritten ----------------- */
+  {
+    clearFakeStore();
+    await seedBoard();
+    await redis([["SET", "stats:games", "99"], ["SET", "stats:flowers", "500"]]);
+
+    await call(adminTrimHandler, adminReq({ confirm: true }));
+
+    const [games] = await redis([["GET", "stats:games"]]);
+    const [flowers] = await redis([["GET", "stats:flowers"]]);
+    assert.equal(games, "99", "stats:games must not be rewritten by a trim");
+    assert.equal(flowers, "500");
+    ok("aggregate counters are left alone — only the board is trimmed");
+  }
+
+  /* ---------------- 26. validation -------------------------------------- */
+  {
+    for (const [label, body] of [
+      ["unknown field rejected", { confirm: true, dryrun: true }],
+      ["keep above the cap rejected", { keep: 101 }],
+      ["keep below 1 rejected", { keep: 0 }],
+      ["non-integer keep rejected", { keep: 2.5 }],
+      ["string keep rejected", { keep: "3" }],
+      ["unknown scope rejected", { scope: "yesterday" }],
+      ["non-boolean confirm rejected", { confirm: "yes" }],
+      ["non-boolean dryRun rejected", { dryRun: "no" }],
+    ]) {
+      const res = await call(adminTrimHandler, adminReq(body));
+      assert.equal(res.statusCode, 400, label);
+    }
+    ok("validation: unknown fields and out-of-range values -> 400");
+  }
+
+  /* ---------------- 27. method, body cap, error hygiene ------------------ */
+  {
+    const get = await call(adminTrimHandler,
+      mockReq({ method: "GET", headers: { "x-real-ip": "10.0.0.3", authorization: `Bearer ${ADMIN}` } }));
+    assert.equal(get.statusCode, 405);
+
+    const big = await call(adminTrimHandler, adminReq({ pad: "x".repeat(5000) }));
+    assert.equal(big.statusCode, 413, "the 4 KB body cap still applies");
+
+    const leaky = /upstash|redis|token|authorization|bearer|wasm|\.js\b/i;
+    const bodies = [
+      (await call(adminTrimHandler, mockReq({ body: {}, headers: { "x-real-ip": "10.0.0.4" } }))).body,
+      (await call(adminTrimHandler, adminReq({ keep: 999 }))).body,
+    ];
+    const saved = process.env.ADMIN_TRIM_TOKEN;
+    delete process.env.ADMIN_TRIM_TOKEN;
+    bodies.push((await call(adminTrimHandler, adminReq({}))).body);
+    process.env.ADMIN_TRIM_TOKEN = saved;
+
+    for (const b of bodies) {
+      assert.ok(!leaky.test(JSON.stringify(b)), `admin error body leaks internals: ${JSON.stringify(b)}`);
+    }
+    ok("admin route: 405 / 413 intact, error bodies generic (no internals)");
+  }
+
+  /* ---------------- 28. rate limited per IP ----------------------------- */
+  {
+    process.env.RATE_LIMIT_ADMIN_TRIM_PER_MIN = "3";
+    const headers = { "x-real-ip": "10.9.9.9", authorization: `Bearer ${ADMIN}` };
+
+    let last = null;
+    for (let i = 0; i < 3; i++) last = await call(adminTrimHandler, mockReq({ body: {}, headers }));
+    assert.equal(last.statusCode, 200, "requests at the limit succeed");
+
+    const blocked = await call(adminTrimHandler, mockReq({ body: {}, headers }));
+    assert.equal(blocked.statusCode, 429);
+    assert.ok(Number(blocked.headers["retry-after"]) >= 1);
+
+    process.env.RATE_LIMIT_ADMIN_TRIM_PER_MIN = "500";
+    ok("admin route is rate limited per IP (3 OK, 4th -> 429 with Retry-After)");
+  }
+
+  /* ---------------- 29. Redis down -> clean 503 ------------------------- */
+  {
+    _setOverride(null);
+    const res = await call(adminTrimHandler, adminReq({ confirm: true }));
+    assert.equal(res.statusCode, 503);
+    assert.equal(res.body.error, "Leaderboard backend unavailable");
+    assert.notEqual(res.statusCode, 200, "never a false success when the backend is down");
+    setOverrideFake();
+    ok("Redis down -> 503, never a crash and never a false success");
+  }
+
+  /* ---------------- 30. the Lua script retains every safety step --------- */
+  {
+    for (const [label, needle] of [
+      ["read the board size", "ZCARD"],
+      ["read the cutoff at rank `expected`", "ZREVRANGE', key, expected - 1, expected - 1"],
+      ["count entries above the cutoff", "ZCOUNT"],
+      ["abort before deleting when the pre-flight fails", "return report('preflight_failed'"],
+      ["read the tie group at the cutoff", "ZRANGEBYSCORE"],
+      ["break the tie on the recorded ts", "HGET"],
+      ["remove everything below the cutoff", "ZREMRANGEBYSCORE"],
+      ["remove the boundary losers by member", "redis.call('ZREM',"],
+      ["assert the survivor count", "entries after the trim"],
+      ["assert no survivor scores below the cutoff", "a surviving entry scores below the cutoff"],
+      ["return success only after verifying", "return report('ok'"],
+    ]) {
+      assert.ok(TRIM_SCRIPT.includes(needle), `trim script must still ${label}`);
+    }
+    // Regression guard: Redis ranks ascend by score, so removing "rank
+    // expected .. -1" would delete the KEEPERS. The fallback must count up
+    // from rank 0 instead.
+    assert.ok(
+      !/ZREMRANGEBYRANK'[^\n]*key, expected/.test(TRIM_SCRIPT),
+      "rank fallback must not use descending-rank semantics (that deletes the keepers)"
+    );
+    ok("trim script retains every safety step (structural check on the Lua source)");
+  }
+  /* ---------------- 31. an inconsistent result is never reported as OK ---- */
+  {
+    clearFakeStore();
+    await seedBoard();
+
+    // Make the script claim 4 survivors when it actually leaves 3.
+    evalCountFault = 1;
+    const res = await call(adminTrimHandler, adminReq({ confirm: true }));
+    evalCountFault = 0;
+
+    assert.equal(res.statusCode, 500, "a read-back that disagrees with the script must not be a 200");
+    assert.equal(res.body.ok, false);
+    assert.equal(res.body.applied, false, "never claim to have applied a trim we could not verify");
+    assert.ok(
+      res.body.warnings.some((w) => /read-back found/.test(w)),
+      "the disagreement is reported in warnings"
+    );
+    ok("read-back guard: a script that misreports its result -> 500, never a false success");
+  }
 }
 
 console.log(`\nALL ${passed} CHECKS PASSED ✅`);

@@ -39,6 +39,7 @@ const DEFAULTS = {
   scoresPerIpPerHour: 240,      // POST /api/scores per IP per hour
   leaderboardPerIpPerMin: 120,  // GET /api/leaderboard per IP per minute (origin hits only)
   globalSessionsPerDay: 3000,   // global circuit breaker: sessions per rolling 24h
+  adminTrimPerIpPerMin: 10,     // POST /api/admin/trim-leaderboard per IP per minute
 };
 
 /** Read a limit from env with a safe fallback (read at call time, so tests/ops can tune it). */

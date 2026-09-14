@@ -119,6 +119,9 @@ Never commit real credentials — `.gitignore` protects `.env*`.
 | `RATE_LIMIT_SCORES_PER_HOUR` | no | Default `240` |
 | `RATE_LIMIT_LEADERBOARD_PER_MIN` | no | Default `120` |
 | `GLOBAL_DAILY_SESSION_LIMIT` | no | Default `3000` |
+| `ADMIN_TRIM_TOKEN` | no | Secret for the admin trim route. Unset (or under 24 chars) ⇒ the route returns `503` and refuses to run |
+| `LEADERBOARD_KEEP` | no | How many entries a trim keeps. Default `3` |
+| `RATE_LIMIT_ADMIN_TRIM_PER_MIN` | no | Default `10` |
 
 \* one of the two pairs. See `.env.example`.
 
@@ -126,7 +129,7 @@ Never commit real credentials — `.gitignore` protects `.env*`.
 
 ## 🔌 API Reference
 
-All endpoints are **same-origin only** (no CORS by design), accept/receive JSON, and are rate-limited per IP.
+All endpoints are **same-origin only** (no CORS by design), accept/receive JSON, and are rate-limited per IP. The one route under `/api/admin/` additionally requires a secret.
 
 ### `POST /api/session`
 
@@ -176,6 +179,101 @@ All endpoints are **same-origin only** (no CORS by design), accept/receive JSON,
 
 ---
 
+## 🧹 Trimming the leaderboard
+
+Keeps only the top N entries of a board and deletes the rest. There are two
+implementations of the same operation:
+
+- **`POST /api/admin/trim-leaderboard`** — the live Redis boards. This is the
+  one you actually run. Implementation: `api/_lib/trim.js`.
+- **`sql/trim-leaderboard.sql`** — the same trim expressed as SQL, for a
+  Postgres/MySQL/SQLite copy of the data. Runnable in all three dialects, with
+  a self-test at `sql/trim-leaderboard.selftest.py`.
+
+### `POST /api/admin/trim-leaderboard`
+
+```jsonc
+// headers: Authorization: Bearer <ADMIN_TRIM_TOKEN>   (or X-Admin-Token: <value>)
+
+// request — the body is OPTIONAL
+{
+  "confirm": true,      // REQUIRED to delete anything
+  "dryRun":  false,     // force a preview even alongside confirm:true
+  "scope":   "all",     // "all" (default) | "today" | "both"
+  "keep":    3          // 1..100, default LEADERBOARD_KEEP or 3
+}
+
+// 200
+{
+  "ok": true, "applied": true, "dryRun": false, "scope": "all", "keep": 3,
+  "boards": [{
+    "key": "lb:all", "status": "ok",
+    "before": 12, "after": 3, "expected": 3, "removed": 9, "wouldRemove": 9,
+    "cutoff": 220, "tiebreak": "timestamp", "countVerified": true,
+    "kept": [ { "rank": 1, "member": "e3a7…", "name": "Bee Hero", "score": 512, "ts": 1756… } ]
+  }],
+  "warnings": ["lb:all was trimmed: GET /api/leaderboard derives aggregates.players …"]
+}
+
+// errors: 400 bad field/value · 401 bad or absent secret · 405 wrong method
+//         409 the board moved mid-trim (nothing removed) · 413 body > 4 KB
+//         429 rate-limited · 500 post-trim verification failed · 503 not configured / backend down
+```
+
+**🔒 Dry run is the default.** An empty body, or any body without
+`"confirm": true`, only reports what *would* happen — so a mistyped `curl`
+cannot wipe the board. Deleting takes an explicit `"confirm": true`.
+
+```bash
+# preview (safe)
+curl -X POST https://your-app.vercel.app/api/admin/trim-leaderboard \
+  -H "Authorization: Bearer $ADMIN_TRIM_TOKEN"
+
+# keep only the top 3
+curl -X POST https://your-app.vercel.app/api/admin/trim-leaderboard \
+  -H "Authorization: Bearer $ADMIN_TRIM_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"confirm": true}'
+```
+
+**How it stays safe.** Redis has no `BEGIN`/`COMMIT`, and `WATCH`/`MULTI`/`EXEC`
+is unusable over the stateless Upstash REST API (`WATCH` is connection-scoped),
+so the read-decide-write sequence runs as a **single Lua script** — the only
+primitive that makes it atomic. The script mirrors the SQL version step for step:
+read the cutoff score → **pre-flight check** that no entry outranks the cutoff
+more times than there are keepers (abort *before* deleting if so) → remove
+everything strictly below the cutoff with `ZREMRANGEBYSCORE` → remove the
+boundary losers → **post-check** that the survivor count is N and that no
+survivor scores below the cutoff. The handler then reads the board back
+independently and refuses to report success if the two disagree.
+
+**Ties.** If several entries share the N-th-place score, the tie is broken by
+`ts` ascending (earliest wins), then by member — the same rule as the SQL
+script's `ORDER BY score DESC, created_at ASC, id ASC`. An entry with no
+recorded `ts` loses to one with provenance. If more than 500 entries are tied,
+the script keeps the right *count* but falls back to Redis rank order and says
+so in `warnings`.
+
+**Two things to know before running it.**
+
+1. **`aggregates.players` drops.** `GET /api/leaderboard` reports
+   `players` as `ZCARD lb:all`, so trimming `lb:all` lowers that number. The
+   `stats:*` counters are deliberately *not* rewritten (they are historical
+   totals) and the drift is reported in `warnings`.
+2. **No rollback.** Redis does not roll Lua back on error, so a failed
+   post-check means the board may be partially trimmed. That check is
+   unreachable by construction, so a failure means the script is wrong — which
+   is why it returns `500` rather than pretending to have succeeded. Inspect
+   the board before retrying.
+
+> ⚠️ **Redis rank direction.** Redis sorted-set ranks ascend by score, so rank
+> `0` is the **lowest** entry. To keep the highest 3 with a bare command you
+> want `ZREMRANGEBYRANK lb:all 0 -4` — *not* `… 3 -1`, which keeps the three
+> **lowest** scores. There is no "keep the top N" command in Redis, which is
+> exactly why the route uses a Lua script that computes the cutoff score.
+
+---
+
 ## 🔁 Retry & New Game (personal best)
 
 - **🔁 RETRY — same player, new session.** Every attempt gets a fresh 15-minute session (one-submission-per-session intact) filed under the same server-issued `playerToken`.
@@ -218,9 +316,12 @@ Violations → `400` before any Redis work. One submission per session (atomic `
 | `POST /api/session` | 120 / IP / hour | `RATE_LIMIT_SESSION_PER_HOUR` |
 | `POST /api/scores` | 240 / IP / hour | `RATE_LIMIT_SCORES_PER_HOUR` |
 | `GET /api/leaderboard` | 120 / IP / min (origin hits; edge cache absorbs polling) | `RATE_LIMIT_LEADERBOARD_PER_MIN` |
+| `POST /api/admin/trim-leaderboard` | 10 / IP / min | `RATE_LIMIT_ADMIN_TRIM_PER_MIN` |
 | Global sessions | 3 000 / rolling 24 h (free-tier circuit breaker, auto-recovers) | `GLOBAL_DAILY_SESSION_LIMIT` |
 
 Limits are deliberately generous: a stall full of students shares one public IP. Exceeding a limit returns `429` + `Retry-After` + clean JSON. If Redis itself is down, the limiter **fails open** (logged server-side) so a limiter outage can never take the game down — the main Redis path already degrades to clean `503`s.
+
+**The admin trim route is the one exception to "fail open".** It is authenticated with `ADMIN_TRIM_TOKEN` (constant-time compared, `Authorization: Bearer …` or `X-Admin-Token: …`) and **fails closed**: if the secret is missing or under 24 characters the route returns `503` and refuses to run. The rate limiter runs *before* the token check, so it is the only thing standing between the secret and an offline brute-force attempt.
 
 **Other decisions:** CORS is intentionally disabled (game and API share one origin — absence of `Access-Control-Allow-Origin` *is* the policy); Redis credentials exist only in server-side env vars; all user-facing text (leaderboard names included) is rendered via `textContent`; API errors are generic clientside, detailed server-side only.
 
@@ -232,7 +333,13 @@ Limits are deliberately generous: a stall full of students shares one public IP.
 npm test
 ```
 
-**55 checks, zero credentials required.** The suite runs the *real* API handlers end-to-end against an in-memory Redis fake injected through the Redis client's test override, covering: session minting & name validation · server-side scoring & impossible-stat rejection · one-submission-per-session · ranking/aggregates/top-10 · rate limiting (limits, `Retry-After`, multi-IP independence, global cap, concurrent-request atomicity) · Redis-outage behavior · security headers/CSP · secrets audit · XSS-safe rendering · error bodies stay generic.
+**71 checks, zero credentials required.** The suite runs the *real* API handlers end-to-end against an in-memory Redis fake injected through the Redis client's test override, covering: session minting & name validation · server-side scoring & impossible-stat rejection · one-submission-per-session · ranking/aggregates/top-10 · rate limiting (limits, `Retry-After`, multi-IP independence, global cap, concurrent-request atomicity) · Redis-outage behavior · security headers/CSP · secrets audit · XSS-safe rendering · error bodies stay generic · **admin trim** (auth fails closed, dry-run default, ties, idempotency, scopes, small/empty boards, validation).
+
+**One honest gap.** The fake Redis cannot execute Lua, so its `EVAL` delegates to a JS model of the trim script (`trimScriptModel` in `test/local-check.mjs`) — everything else in the admin path is production code. Two things compensate: the handler reads the board back after every trim and refuses to report success if the count disagrees, and the last check in the suite asserts structurally that the real Lua still performs each safety step (including a regression guard against the inverted `ZREMRANGEBYRANK` rank direction). The Lua itself has not been executed against a real Redis in this repo.
+
+```bash
+python sql/trim-leaderboard.selftest.py   # SQL variant: 12 checks
+```
 
 ---
 
@@ -253,13 +360,19 @@ pollinator-panic/
 │   ├── session.js          # POST — session minting
 │   ├── scores.js           # POST — submissions
 │   ├── leaderboard.js      # GET  — boards + aggregates
+│   ├── admin/
+│   │   └── trim-leaderboard.js  # POST — keep the top N entries (token-gated, dry-run default)
 │   └── _lib/
 │       ├── redis.js        # zero-dep Upstash REST client (+ test override)
 │       ├── ratelimit.js    # Redis fixed-window limiter
 │       ├── http.js         # body parsing (4 KB cap), error helpers
 │       ├── score.js        # scoring formula + caps
+│       ├── trim.js         # atomic trim: Lua script + verification report
 │       └── validate.js     # stat re-validation
-├── test/local-check.mjs    # 55-check suite (in-memory Redis fake)
+├── sql/
+│   ├── trim-leaderboard.sql          # same trim as SQL (Postgres / MySQL / SQLite)
+│   └── trim-leaderboard.selftest.py  # 12-check proof it works (in-memory SQLite)
+├── test/local-check.mjs    # 71-check suite (in-memory Redis fake)
 ├── vercel.json             # security headers
 ├── .env.example            # variable names only — no secrets
 └── package.json            # zero dependencies

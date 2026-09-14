@@ -53,6 +53,34 @@ async function readJsonBody(req) {
   return parseJson(Buffer.concat(chunks).toString("utf8"));
 }
 
+/**
+ * Like readJsonBody, but an absent/empty body yields {} instead of a 400.
+ * Used by routes where a body is optional — POST /api/admin/trim-leaderboard
+ * treats a bare request as a dry run, so a bodyless curl is a preview rather
+ * than an error. The 4 KB cap applies exactly as in readJsonBody.
+ */
+async function readOptionalJsonBody(req) {
+  if (req.body !== undefined && req.body !== null) {
+    return readJsonBody(req);
+  }
+
+  // No body property and nothing streamable (e.g. a bare mock in tests).
+  if (typeof req[Symbol.asyncIterator] !== "function") return {};
+
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) {
+      throw httpError(413, "Request body too large");
+    }
+    chunks.push(chunk);
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  if (!text.trim()) return {};
+  return parseJson(text);
+}
+
 function parseJson(text) {
   if (!text || !text.trim()) throw httpError(400, "Request body is required");
   if (text.length > MAX_BODY_BYTES) throw httpError(413, "Request body too large");
@@ -68,4 +96,4 @@ function parseJson(text) {
   return parsed;
 }
 
-module.exports = { readJsonBody, httpError, isErrorHttp, MAX_BODY_BYTES };
+module.exports = { readJsonBody, readOptionalJsonBody, httpError, isErrorHttp, MAX_BODY_BYTES };
